@@ -1,0 +1,185 @@
+syntax = "proto3";
+
+package scheduler;
+
+option go_package = "banqi/server/pb";
+
+// worker 拉取任务请求（含机器规格，服务端按规格匹配任务量）
+message TaskRequest {
+  string worker_id = 1;
+  string client_version = 2;
+  int32 threads = 3;          // 可用线程数
+  int64 memory_mb = 4;        // 可用内存
+  string current_network = 5; // 本地已有网络 sha（空表示需要下载）
+}
+
+// 任务响应
+message TaskResponse {
+  string task_id = 1;
+  TaskKind kind = 2;
+  string network_sha = 3;       // 主网络（训练网络）
+  string opponent_sha = 4;      // rating 对打时的对手网络；selfplay 为空
+  string network_url = 5;       // R2 预签名下载 URL（主网络）
+  string opponent_url = 6;      // 对手网络下载 URL
+  string network_sha_remote = 7;  // 服务端当前 best sha（用于本地缓存比对）
+  int32 games = 8;              // 本批对局数
+  SelfPlayParams params = 9;
+  string message = 10;          // 无任务时的说明（task_waiting 等）
+}
+
+enum TaskKind {
+  TASK_NONE = 0;      // 无任务，按 message 退避轮询
+  TASK_SELFPLAY = 1;
+  TASK_RATING = 2;    // gatekeeper / rating 对打
+}
+
+message SelfPlayParams {
+  int32 mcts_sims = 1;
+  float temperature = 2;
+  bool playout_cap_random = 3;
+  string variant = 4;           // 4x8 / 4x4 / 4x2
+  string extra_config = 5;      // JSON 透传
+}
+
+// episode 元数据上报：服务端只收元数据 + 签发 R2 预签名 PUT，数据直传 R2
+message EpisodeMeta {
+  string worker_id = 1;
+  string task_id = 2;
+  int32 game_count = 3;
+  int32 total_steps = 4;
+  int32 winner = 5;             // 1 红 / -1 黑 / 0 平；rating 任务另有字段
+  string network_sha = 6;
+  int64 timestamp = 7;
+  int64 content_length = 8;     // 待上传对象大小
+  string content_sha256 = 9;    // 对象 sha256（R2 强校验）
+}
+
+message EpisodeAck {
+  bool accepted = 1;
+  string message = 2;
+  string upload_url = 3;        // 预签名 PUT URL；accepted=false 时为空
+  string object_key = 4;        // R2 对象键 episodes/<sha>/<uuid>.jsonl.gz
+}
+
+// 网络请求：sha 为空 = 拉取当前 best
+message NetworkRequest {
+  string sha = 1;
+}
+
+message NetworkInfo {
+  string sha = 1;
+  string download_url = 2;      // 预签名 GET URL
+  int64 created_at = 3;
+  bool is_best = 4;
+  string game_data = 5;         // 训练侧附加信息（parent sha 等），JSON
+}
+
+// trainer（GPU 机）注册新网络 → 触发 gatekeeper 对打
+message RegisterNetworkRequest {
+  string sha = 1;
+  string parent_sha = 2;
+  string upload_url = 3;        // trainer 已直传 R2，这里登记元数据
+  string notes = 4;
+}
+
+message RegisterNetworkAck {
+  bool accepted = 1;
+  string message = 2;
+  string match_task_hint = 3;   // 若已生成 gatekeeper 任务，附说明
+}
+
+// 对局结果上报（selfplay 汇总 / rating 单局）
+message MatchResult {
+  string worker_id = 1;
+  string task_id = 2;
+  TaskKind kind = 3;
+  string network_sha = 4;
+  string opponent_sha = 5;
+  int32 games = 6;              // 本批局数
+  int32 wins = 7;               // 主网络视角（统计用）
+  int32 losses = 8;
+  int32 draws = 9;
+  // 成对五项计数（换色配对两局一组）：rating 任务必填，selfplay 为 0
+  int32 pair_ll = 10;
+  int32 pair_ld = 11;
+  int32 pair_dd = 12;
+  int32 pair_dw = 13;
+  int32 pair_ww = 14;
+}
+
+message MatchResultAck {
+  bool accepted = 1;
+  string message = 2;
+  bool match_concluded = 3;     // 该 gatekeeper 对打已出结论
+  bool promoted = 4;            // 新网络晋级 best
+  string best_sha = 5;          // 晋级后的 best（未变则当前 best）
+}
+
+// 心跳 + 控制参数（worker 周期上报资源与版本声明）
+message HeartbeatRequest {
+  string worker_id = 1;
+  int32 current_threads = 2;
+  int32 completed_games = 3;
+  string running_task_id = 4;
+  string client_version = 5;    // collector 版本声明（仅记录/展示，不做强校验）
+  int64 memory_mb = 6;          // 可用内存
+}
+
+message HeartbeatReply {
+  bool pause_self_play = 1;
+  int32 mcts_sims = 2;          // 覆盖值，0 表示不覆盖
+  float temperature = 3;
+  bool playout_cap_random = 4;
+  string best_network = 5;      // 当前 best sha（供 worker 判断是否换网）
+}
+
+// trainer 请求签发网络上传预签名 PUT（R2 凭据只在调度器持有，trainer 零配置）
+message SignNetworkUploadRequest {
+  string trainer_id = 1;
+  string sha = 2;               // 网络内容 sha256（决定对象键与去重）
+  int64 content_length = 3;
+  string content_sha256 = 4;
+}
+
+message SignNetworkUploadAck {
+  bool accepted = 1;
+  string message = 2;
+  string upload_url = 3;        // 预签名 PUT；accepted=false 时为空
+  string object_key = 4;        // networks/<sha>.bin
+}
+
+// trainer 拉取已登记 episode 的预签名 GET 列表（游标分页）
+message ListEpisodesRequest {
+  int32 limit = 1;              // 单次最多返回条数（0 = 服务端默认）
+  string after_key = 2;         // 游标：仅返回 object_key 字典序大于它的对象
+}
+
+message EpisodeObject {
+  string object_key = 1;
+  string download_url = 2;
+  int64 size = 3;
+}
+
+message ListEpisodesReply {
+  repeated EpisodeObject objects = 1;
+  bool has_more = 2;
+}
+
+// 调度器全局信息（trainer 启动时获取变体，无需命令行传入）
+message GetInfoRequest {}
+
+message GetInfoReply {
+  string variant = 1;
+}
+
+service SchedulerService {
+  rpc GetInfo (GetInfoRequest) returns (GetInfoReply);
+  rpc GetTask (TaskRequest) returns (TaskResponse);
+  rpc ReportEpisode (EpisodeMeta) returns (EpisodeAck);
+  rpc GetNetwork (NetworkRequest) returns (NetworkInfo);
+  rpc RegisterNetwork (RegisterNetworkRequest) returns (RegisterNetworkAck);
+  rpc ReportMatchResult (MatchResult) returns (MatchResultAck);
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
+  rpc SignNetworkUpload (SignNetworkUploadRequest) returns (SignNetworkUploadAck);
+  rpc ListEpisodes (ListEpisodesRequest) returns (ListEpisodesReply);
+}
