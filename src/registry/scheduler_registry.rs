@@ -50,6 +50,8 @@ pub struct SchedulerTask {
     pub games: usize,
     pub mcts_sims: usize,
     pub variant: String,
+    /// 课程学习：服务端下发的初始预翻棋子数（extra_config 透传；None = 变体默认值）。
+    pub initial_revealed: Option<usize>,
 }
 
 pub struct SchedulerRegistry {
@@ -141,12 +143,17 @@ impl SchedulerRegistry {
         // 主网络：sha 变化或本地无缓存时经预签名 URL 下载
         self.ensure_downloaded(&resp.network_sha, &resp.network_url)?;
 
-        let (mcts_sims, variant) = resp.params.as_ref().map_or((0, String::new()), |p| {
-            (
-                p.mcts_sims.max(0) as usize,
-                p.variant.trim().to_lowercase(),
-            )
-        });
+        let (mcts_sims, variant, initial_revealed) =
+            resp.params.as_ref().map_or((0, String::new(), None), |p| {
+                let mcts = p.mcts_sims.max(0) as usize;
+                let variant = p.variant.trim().to_lowercase();
+                let revealed = if p.extra_config.is_empty() {
+                    None
+                } else {
+                    parse_extra_config(&p.extra_config)
+                };
+                (mcts, variant, revealed)
+            });
         if variant.is_empty() {
             anyhow::bail!("服务端未下发变体（SelfPlayParams.variant 为空），请升级调度器并配置 SCHEDULER_VARIANT");
         }
@@ -159,6 +166,7 @@ impl SchedulerRegistry {
             games: resp.games.max(0) as usize,
             mcts_sims,
             variant,
+            initial_revealed,
         };
 
         // rating 任务：对手网络同样需就绪
@@ -167,8 +175,8 @@ impl SchedulerRegistry {
         }
 
         println!(
-            "[scheduler] 任务 task={} kind={:?} variant={} network={} opponent={} games={}",
-            task.task_id, task.kind, task.variant, task.network_sha, task.opponent_sha, task.games
+            "[scheduler] 任务 task={} kind={:?} variant={} network={} opponent={} games={} initial_revealed={:?}",
+            task.task_id, task.kind, task.variant, task.network_sha, task.opponent_sha, task.games, task.initial_revealed
         );
         Ok(Some(task))
     }
@@ -359,6 +367,23 @@ impl SchedulerRegistry {
 fn hex_sha256(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 解析 SelfPlayParams.extra_config（JSON 透传）中的课程参数。
+/// 仅提取 `initial_revealed_pieces`；0 或解析失败返回 None（用变体默认值）。
+fn parse_extra_config(json: &str) -> Option<usize> {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[scheduler] ⚠️ extra_config 解析失败（忽略课程参数）: {json} ({e})");
+            return None;
+        }
+    };
+    let n = v.get("initial_revealed_pieces")?.as_u64()? as usize;
+    if n == 0 {
+        return None;
+    }
+    Some(n)
 }
 
 /// SRI：文件内容 sha256 是否等于期望的 hex sha（大小写不敏感）。

@@ -185,7 +185,7 @@ fn play_one_game<G>(
     player_a_is_red: bool,
     model_sims: usize,
     game_seed: Option<u64>,
-    make_env: fn() -> G,
+    make_env: &Arc<dyn Fn() -> G + Send + Sync>,
 ) -> GameOutcome
 where
     G: GameEnv + AsDarkChessRef + SeedableEnv + Default,
@@ -248,7 +248,7 @@ pub(crate) fn play_one_game_expectimax<G>(
     engine: &ExpectimaxEngine,
     player_a_is_red: bool,
     game_seed: Option<u64>,
-    make_env: fn() -> G,
+    make_env: &Arc<dyn Fn() -> G + Send + Sync>,
 ) -> GameOutcome
 where
     G: GameEnv + AsDarkChessRef + SeedableEnv + Default,
@@ -369,7 +369,7 @@ fn play_one_game_recorded<G>(
     player_a_is_red: bool,
     config: &SelfPlayConfig,
     game_seed: Option<u64>,
-    make_env: fn() -> G,
+    make_env: &Arc<dyn Fn() -> G + Send + Sync>,
 ) -> GameOutcome
 where
     G: GameEnv + AsDarkChessRef + SeedableEnv + Default,
@@ -542,7 +542,8 @@ pub struct MatchParams<'a, G: GameEnv> {
     pub model_sims: usize,
     /// 线程池：Some = 原生多线程（Rust 持模型 / 规则），None = 单线程。
     pub thread_pool: Option<&'a rayon::ThreadPool>,
-    pub make_env: fn() -> G,
+    /// 环境工厂：每局调用一次（支持课程参数注入的闭包形式）。
+    pub make_env: Arc<dyn Fn() -> G + Send + Sync>,
 }
 
 /// 多局比赛结果。
@@ -578,7 +579,7 @@ where
                 player_a_is_red,
                 params.config,
                 game_seed,
-                params.make_env,
+                &params.make_env,
             )
         } else {
             play_one_game(
@@ -587,7 +588,7 @@ where
                 player_a_is_red,
                 params.model_sims,
                 game_seed,
-                params.make_env,
+                &params.make_env,
             )
         }
     };

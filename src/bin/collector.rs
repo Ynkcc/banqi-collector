@@ -20,7 +20,10 @@ use banqi_collector::pipeline::self_play::{
 use banqi_collector::registry::{SchedulerConfig, SchedulerRegistry};
 use banqi_collector::registry::scheduler_registry::pb::TaskKind;
 use banqi_core::core::env::traits::GameEnv;
-use banqi_core::core::env::{DarkChessEnv, variants::{Game4x4Env, MiniDarkChessEnv}};
+use banqi_core::core::env::{
+    CurriculumEnv, DarkChessEnv,
+    variants::{Game4x4Env, MiniDarkChessEnv},
+};
 use banqi_engine::inference::onnx::{OnnxModel, OnnxEvaluator};
 
 #[derive(Parser, Debug)]
@@ -115,6 +118,7 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                 let model = registry.model(&task.network_sha)?;
                 let result = run_variant_dispatch(
                     &task.variant,
+                    task.initial_revealed,
                     Arc::clone(&model),
                     Arc::clone(&model),
                     &config,
@@ -157,6 +161,7 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                 let n = (task.games - task.games % 2).max(2);
                 let result = run_variant_dispatch(
                     &task.variant,
+                    task.initial_revealed,
                     candidate,
                     opponent,
                     &config,
@@ -213,6 +218,7 @@ fn avg_steps(episodes: &[GameEpisode]) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn run_variant_dispatch(
     variant: &str,
+    initial_revealed: Option<usize>,
     model_a: Arc<OnnxModel>,
     model_b: Arc<OnnxModel>,
     config: &SelfPlayConfig,
@@ -221,14 +227,15 @@ fn run_variant_dispatch(
     pool: &rayon::ThreadPool,
 ) -> Result<MatchResult> {
     match variant {
-        "4x8" => run_games::<DarkChessEnv>(model_a, model_b, config, n_games, record_episodes, pool),
-        "4x4" => run_games::<Game4x4Env>(model_a, model_b, config, n_games, record_episodes, pool),
-        "mini" => run_games::<MiniDarkChessEnv>(model_a, model_b, config, n_games, record_episodes, pool),
+        "4x8" => run_games::<DarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
+        "4x4" => run_games::<Game4x4Env>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
+        "mini" => run_games::<MiniDarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
         other => anyhow::bail!("未知变体: {other}（可选 4x8 / 4x4 / mini）"),
     }
 }
 
 fn run_games<G>(
+    initial_revealed: Option<usize>,
     model_a: Arc<OnnxModel>,
     model_b: Arc<OnnxModel>,
     config: &SelfPlayConfig,
@@ -240,11 +247,19 @@ where
     G: GameEnv
         + AsDarkChessRef
         + SeedableEnv
+        + CurriculumEnv
         + Send
         + Sync
         + Default
         + 'static,
 {
+    let make_env: Arc<dyn Fn() -> G + Send + Sync> = match initial_revealed {
+        Some(n) => {
+            println!("[curriculum] 初始翻子数 override = {n}（变体默认值已覆盖）");
+            Arc::new(move || G::with_initial_revealed(n))
+        }
+        None => Arc::new(G::default),
+    };
     let spec_a = PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(model_a)));
     let spec_b = PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(model_b)));
     let result = run_match_core(MatchParams {
@@ -256,7 +271,7 @@ where
         record_episodes,
         model_sims: config.mcts_sims,
         thread_pool: Some(pool),
-        make_env: G::default,
+        make_env,
     });
     if result.episodes.is_empty() && result.nnue_episodes.is_empty() && record_episodes {
         anyhow::bail!("自对弈 0 局产出（检查模型与配置）");
