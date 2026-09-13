@@ -70,8 +70,9 @@ impl<G: GameEnv> Evaluator<G> for RandomEval {
         let mut logits = Vec::with_capacity(envs.len());
         let mut values = Vec::with_capacity(envs.len());
         for env in envs {
-            let mut lg = vec![0.0f32; G::action_space_size()];
-            let mut masks = vec![0i32; G::action_space_size()];
+            let action_space = env.action_space_size();
+            let mut lg = vec![0.0f32; action_space];
+            let mut masks = vec![0i32; action_space];
             env.action_masks_into(&mut masks);
             for (i, &m) in masks.iter().enumerate() {
                 if m == 1 {
@@ -135,7 +136,7 @@ where
 }
 
 fn random_action<G: GameEnv>(env: &G) -> Option<usize> {
-    let mut masks = vec![0i32; G::action_space_size()];
+    let mut masks = vec![0i32; env.action_space_size()];
     env.action_masks_into(&mut masks);
     let legal: Vec<usize> = masks
         .iter()
@@ -195,7 +196,7 @@ where
         env.set_seed(s);
     }
     let mut moves = 0;
-    let max_moves = G::max_steps();
+    let max_moves = env.max_steps();
 
     while !env.check_game_over_conditions().0 {
         if env.check_game_over_conditions().2.is_some() {
@@ -354,7 +355,7 @@ where
         }
 
         step += 1;
-        if step >= G::max_steps() {
+        if step >= env.max_steps() {
             let (ep, r) = finish(meta, Some(0), step, player_a_is_red, features, search_values, players, actions);
             return GameOutcome { result: r, moves: step, episode: None, nnue_episode: Some(ep) };
         }
@@ -498,7 +499,7 @@ where
         }
 
         step += 1;
-        if step >= G::max_steps() {
+        if step >= env.max_steps() {
             let ep = finalize_episode(episode_data, Some(0), env.terminal_health_diff_red(), nnue_meta_and_features(env.as_darkchess_ref(), nnue_features));
             return outcome_from_episode(ep, player_a_is_red);
         }

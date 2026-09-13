@@ -32,6 +32,11 @@ name = "banqi-collector"
 path = "src/bin/collector.rs"
 required-features = ["onnx"]
 
+# 离线胜率曲线（ONNX 模型 × 模拟数），非采集链路的一部分
+[[example]]
+name = "onnx_sims_curve"
+required-features = ["onnx"]
+
 [build-dependencies]
 tonic-build = "0.12"
 

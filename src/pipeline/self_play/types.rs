@@ -350,7 +350,7 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
 
             // --- 步数限制检查：使用环境给定的步数上限 ---
             step += 1;
-            if step >= G::max_steps() {
+            if step >= env.max_steps() {
                 // 步数上限截断：环境视其为 truncated 平局 (winner=Some(0))，
                 // 与终局分支语义对齐，game_result 回填 0.0。
                 return crate::pipeline::self_play::finalize_episode(
