@@ -287,12 +287,22 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
 
             // --- MCTS 搜索 (同步) ---
             let search_result = match step_mcts.run() {
-                Some(result) => result,
-                None => {
+                Ok(Some(result)) => result,
+                Ok(None) => {
                     let (_, _, winner) = env.check_game_over_conditions();
                     return crate::pipeline::self_play::finalize_episode(
                         episode_data,
                         winner,
+                        env.terminal_health_diff_red(),
+                        None,
+                    );
+                }
+                Err(e) => {
+                    // 推理失败：本局作废（winner 置 None），不写入训练数据。
+                    eprintln!("❌ MCTS 评估失败，本局作废: {e}");
+                    return crate::pipeline::self_play::finalize_episode(
+                        episode_data,
+                        None,
                         env.terminal_health_diff_red(),
                         None,
                     );

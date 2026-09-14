@@ -15,6 +15,10 @@
 - `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `serialize`），已移除 PyO3（PyPredictor）分支；`serialize::episode_to_dict_json` 行格式与主仓库及 Python 侧契约一致。
 - `proto/scheduler.proto`：与 banqi-scheduler 仓库副本同步维护（双侧同步，变更须同时更新）。
 
+## 变更记录
+
+- 2026-09-15：同步 `banqi-core` 的 MCTS 评估契约变更（`Evaluator::evaluate` / `GumbelMCTS::run` 改为 `Result`）：`RandomEval` / `PlayerEval` 实现改为返回 `Result<EvaluatorOutput, EvaluatorError>`；`model_mcts_action` / `policy_argmax_action` / `play_one_game_recorded` / `SelfPlayRunner::play_episode` 在推理失败时**打印错误并令本局作废**（`episode: None` 或 `winner: None`），不再 panic、也不写入无效训练数据；bin 侧原有「record 模式下 0 局产出即 `bail!`」的判定会把失败暴露为批次错误。
+
 ## 入口
 
 `src/bin/collector.rs` → bin `banqi-collector`（required-features = `onnx`）：

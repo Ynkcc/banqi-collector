@@ -16,7 +16,9 @@ use rayon::prelude::*;
 
 use banqi_core::core::env::{DarkChessEnv, GameEnv};
 use banqi_core::core::expectimax::ExpectimaxEngine;
-use banqi_core::core::mcts::{Evaluator, EvaluatorOutput, GumbelConfig, GumbelMCTS};
+use banqi_core::core::mcts::{
+    Evaluator, EvaluatorError, EvaluatorOutput, GumbelConfig, GumbelMCTS,
+};
 
 use super::{finalize_episode, GameEpisode, SelfPlayConfig};
 
@@ -68,7 +70,7 @@ pub enum PlayerSpec<G: GameEnv> {
 struct RandomEval;
 
 impl<G: GameEnv> Evaluator<G> for RandomEval {
-    fn evaluate(&self, envs: &[G]) -> EvaluatorOutput {
+    fn evaluate(&self, envs: &[G]) -> Result<EvaluatorOutput, EvaluatorError> {
         let mut logits = Vec::with_capacity(envs.len());
         let mut values = Vec::with_capacity(envs.len());
         for env in envs {
@@ -84,7 +86,7 @@ impl<G: GameEnv> Evaluator<G> for RandomEval {
             logits.push(lg);
             values.push(0.0);
         }
-        EvaluatorOutput { logits, values, health: None }
+        Ok(EvaluatorOutput { logits, values, health: None })
     }
 }
 
@@ -95,7 +97,7 @@ enum PlayerEval<G: GameEnv + AsDarkChessRef> {
 }
 
 impl<G: GameEnv + AsDarkChessRef + Sync> Evaluator<G> for PlayerEval<G> {
-    fn evaluate(&self, envs: &[G]) -> EvaluatorOutput {
+    fn evaluate(&self, envs: &[G]) -> Result<EvaluatorOutput, EvaluatorError> {
         match self {
             PlayerEval::Model(e) => e.evaluate(envs),
             PlayerEval::Random(e) => e.evaluate(envs),
@@ -135,7 +137,14 @@ where
         ..Default::default()
     };
     let mut mcts = GumbelMCTS::new(env, evaluator, config);
-    mcts.run().map(|r| r.action)
+    match mcts.run() {
+        Ok(Some(r)) => Some(r.action),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("❌ 评估失败（模型推理），本步无动作: {e}");
+            None
+        }
+    }
 }
 
 /// 纯策略动作选择：对 policy head logits 做合法动作掩码后取 argmax，不做任何搜索。
@@ -145,7 +154,13 @@ fn policy_argmax_action<G>(env: &G, evaluator: &Arc<dyn Evaluator<G> + Send + Sy
 where
     G: GameEnv + AsDarkChessRef + Sync,
 {
-    let out = evaluator.evaluate(std::slice::from_ref(env));
+    let out = match evaluator.evaluate(std::slice::from_ref(env)) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("❌ 评估失败（policy argmax），本步无动作: {e}");
+            return None;
+        }
+    };
     let logits = out.logits.first()?;
     let mut masks = vec![0i32; env.action_space_size()];
     env.action_masks_into(&mut masks);
@@ -464,11 +479,17 @@ where
 
         let mut mcts = GumbelMCTS::new(&env, evaluator, step_gumbel_cfg);
         let search_result = match mcts.run() {
-            Some(r) => r,
-            None => {
+            Ok(Some(r)) => r,
+            Ok(None) => {
                 let (_, _, winner) = env.check_game_over_conditions();
                 let ep = finalize_episode(episode_data, winner, env.terminal_health_diff_red(), nnue_meta_and_features(env.as_darkchess_ref(), nnue_features));
                 return outcome_from_episode(ep, player_a_is_red);
+            }
+            Err(e) => {
+                // 推理失败：本局作废（不产出 episode），由 bin 按「0 局产出」报错，
+                // 避免把无效局面写进训练数据。
+                eprintln!("❌ 自对弈评估失败，本局作废: {e}");
+                return GameOutcome { result: 0, moves: step, episode: None, nnue_episode: None };
             }
         };
 
