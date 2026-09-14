@@ -229,8 +229,8 @@ fn run_variant_dispatch(
     match variant {
         "4x8" => run_games::<DarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
         "4x4" => run_games::<Game4x4Env>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
-        "mini" => run_games::<MiniDarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
-        other => anyhow::bail!("未知变体: {other}（可选 4x8 / 4x4 / mini）"),
+        "4x2" => run_games::<MiniDarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
+        other => anyhow::bail!("未知变体: {other}（可选 4x8 / 4x4 / 4x2）"),
     }
 }
 
