@@ -53,8 +53,10 @@ fn nnue_meta_and_features(
 pub enum PlayerSpec<G: GameEnv> {
     /// Expectimax + NNUE 引擎（独立 DFS 决策，不经 Gumbel MCTS）。
     Expectimax(Arc<ExpectimaxEngine>),
-    /// Rust 侧持有 .pt / .onnx 模型的评估器（推理不经过 GIL）。
+    /// Rust 侧持有 .pt / .onnx 模型的评估器（经 Gumbel MCTS 决策）。
     ModelEval(Arc<dyn Evaluator<G> + Send + Sync>),
+    /// 纯策略：直接取 policy head 在合法动作上的 argmax，不做任何搜索。
+    PolicyArgmax(Arc<dyn Evaluator<G> + Send + Sync>),
     Random,
 }
 
@@ -108,6 +110,7 @@ where
 {
     match spec {
         PlayerSpec::ModelEval(e) => PlayerEval::Model(e.clone()),
+        PlayerSpec::PolicyArgmax(e) => PlayerEval::Model(e.clone()),
         PlayerSpec::Random => PlayerEval::Random(RandomEval),
         PlayerSpec::Expectimax(_) => {
             unreachable!("Expectimax 选手不经 make_evaluator / MCTS 路径（应在调用处分流）")
@@ -133,6 +136,29 @@ where
     };
     let mut mcts = GumbelMCTS::new(env, evaluator, config);
     mcts.run().map(|r| r.action)
+}
+
+/// 纯策略动作选择：对 policy head logits 做合法动作掩码后取 argmax，不做任何搜索。
+/// 非法动作的 logits 一律忽略（不依赖评估器是否已置 -inf），不可用值同样跳过；
+/// 全部非法/非有限时返回 None，由上层按对局终止处理。
+fn policy_argmax_action<G>(env: &G, evaluator: &Arc<dyn Evaluator<G> + Send + Sync>) -> Option<usize>
+where
+    G: GameEnv + AsDarkChessRef + Sync,
+{
+    let out = evaluator.evaluate(std::slice::from_ref(env));
+    let logits = out.logits.first()?;
+    let mut masks = vec![0i32; env.action_space_size()];
+    env.action_masks_into(&mut masks);
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &lg) in logits.iter().enumerate() {
+        if masks.get(i).copied().unwrap_or(0) != 1 || !lg.is_finite() {
+            continue;
+        }
+        if best.map_or(true, |(_, bv)| lg > bv) {
+            best = Some((i, lg));
+        }
+    }
+    best.map(|(a, _)| a)
 }
 
 fn random_action<G: GameEnv>(env: &G) -> Option<usize> {
@@ -161,6 +187,7 @@ where
             e.search_par(env.as_darkchess_ref()).map(|r| r.action)
         }
         PlayerSpec::ModelEval(e) => model_mcts_action(env, &PlayerEval::Model(e.clone()), model_sims),
+        PlayerSpec::PolicyArgmax(e) => policy_argmax_action(env, e),
         PlayerSpec::Random => random_action(env),
     }
 }

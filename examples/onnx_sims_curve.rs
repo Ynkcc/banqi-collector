@@ -9,6 +9,10 @@
 //     --model ../banqi-training/outputs/4x2/checkpoints/random_health.onnx \
 //     --opponent random --sims 64,256,1024,4096 --games 40
 //
+// 纯策略验收（不搜索，policy head 掩码后 argmax）：
+//   cargo run --release --features onnx --example onnx_sims_curve -- \
+//     --model <model.onnx> --opponent random --policy-only --games 100
+//
 // 注意：评估路径的 MCTS 参数由 match_core::model_mcts_action 固定为
 // c_scale=0.25 / max_considered_actions=16，而 banqi-tauri 的 MctsOnnx 对手用
 // GumbelConfig::with_search_scale（c_scale=1.0）。二者不完全等价，本曲线用于
@@ -112,6 +116,9 @@ struct Args {
     /// 固定种子（缺省不固定）
     #[arg(long)]
     seed: Option<u64>,
+    /// 被测选手 A 改用纯策略（policy head argmax，无搜索）；此时 --sims 仅取首档占位
+    #[arg(long)]
+    policy_only: bool,
 }
 
 fn build_opponent(args: &Args) -> Result<PlayerSpec<MiniDarkChessEnv>> {
@@ -164,12 +171,23 @@ fn main() -> Result<()> {
     if sims_list.is_empty() || sims_list.contains(&0) {
         return Err(anyhow!("--sims 需为非零模拟数列表，如 64,256,1024"));
     }
+    // 纯策略模式没有搜索次数维度，压成单档，避免重复打同样的对局。
+    let sims_list: Vec<usize> = if args.policy_only {
+        vec![sims_list[0]]
+    } else {
+        sims_list
+    };
 
     let model_a = Arc::new(
         OnnxModel::new(&args.model, "auto")
             .map_err(|e| anyhow!("ONNX 模型加载失败 ({}): {e}", args.model))?,
     );
-    let spec_a = PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<MiniDarkChessEnv>::new(model_a)));
+    let eval_a = Arc::new(OnnxEvaluator::<MiniDarkChessEnv>::new(model_a));
+    let spec_a = if args.policy_only {
+        PlayerSpec::PolicyArgmax(eval_a)
+    } else {
+        PlayerSpec::ModelEval(eval_a)
+    };
     let spec_b = build_opponent(&args)?;
 
     let pool = ThreadPoolBuilder::new()
@@ -191,7 +209,11 @@ fn main() -> Result<()> {
     let make_env: Arc<dyn Fn() -> MiniDarkChessEnv + Send + Sync> =
         Arc::new(MiniDarkChessEnv::default);
 
-    println!("选手 A（被测）: {}", args.model);
+    println!(
+        "选手 A（被测）: {}{}",
+        args.model,
+        if args.policy_only { " [纯策略 argmax]" } else { "" }
+    );
     println!(
         "选手 B（对手）: {}{}",
         args.opponent,
@@ -206,8 +228,8 @@ fn main() -> Result<()> {
         pool.current_num_threads()
     );
     println!();
-    println!("| 模拟数 | 胜 | 和 | 负 | 胜率 | 得分率 | 平均步数 | 用时(s) |");
-    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!("| 策略 | 胜 | 和 | 负 | 胜率 | 得分率 | 不输率 | 平均步数 | 用时(s) |");
+    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
 
     for &sims in &sims_list {
         let started = Instant::now();
@@ -224,14 +246,20 @@ fn main() -> Result<()> {
         });
         let elapsed = started.elapsed().as_secs_f64();
         let n = args.games.max(1) as f32;
+        let label = if args.policy_only {
+            "纯策略".to_string()
+        } else {
+            sims.to_string()
+        };
         println!(
-            "| {} | {} | {} | {} | {:.1}% | {:.1}% | {:.1} | {:.1} |",
-            sims,
+            "| {} | {} | {} | {} | {:.1}% | {:.1}% | {:.1}% | {:.1} | {:.1} |",
+            label,
             r.wins,
             r.draws,
             r.losses,
             100.0 * r.wins as f32 / n,
             100.0 * (r.wins as f32 + 0.5 * r.draws as f32) / n,
+            100.0 * (r.wins as f32 + r.draws as f32) / n,
             r.avg_moves,
             elapsed
         );

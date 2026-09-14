@@ -127,6 +127,7 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                     &pool,
                 )?;
                 let gz = episodes_gz(&result.episodes)?;
+
                 let total_steps: usize =
                     result.episodes.iter().map(|e| e.game_length).sum();
                 // 批内聚合胜方（调度端仅作日志/统计用）
@@ -137,14 +138,16 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                 } else {
                     0
                 };
-                registry.report_episode(
+                if let Err(e) = registry.report_episode(
                     &task.task_id,
                     &task.network_sha,
                     result.episodes.len(),
                     total_steps,
                     winner,
                     gz,
-                )?;
+                ) {
+                    eprintln!("[iter {iteration}] ⚠️ episode 上报失败（本批丢弃，继续拉任务）: {e}");
+                }
                 println!(
                     "[iter {iteration}] selfplay task={} 🎮 {} 局（步均 {:.1}）耗时 {:.1}s",
                     task.task_id,
@@ -181,7 +184,7 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                     started.elapsed().as_secs_f64()
                 );
                 registry.add_completed_games(n);
-                registry.report_match_result(
+                if let Err(e) = registry.report_match_result(
                     &task.task_id,
                     &task.network_sha,
                     &task.opponent_sha,
@@ -190,7 +193,11 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                     result.losses,
                     result.draws,
                     pairs,
-                )?;
+                ) {
+                    eprintln!(
+                        "[iter {iteration}] ⚠️ rating 结果上报被拒（对局已判停或已由其他 worker 完成）: {e}"
+                    );
+                }
             }
             TaskKind::TaskNone => unreachable!("get_task 已过滤 TASK_NONE"),
         }
