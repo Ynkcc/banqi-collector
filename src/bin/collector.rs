@@ -3,21 +3,25 @@
 // 自 rust_4x8/src/bin/collector.rs 迁入（banqi-collector 拆分），仅保留分布式形态：
 // SchedulerRegistry（gRPC GetTask + R2 预签名直传；selfplay/rating 双任务）。
 // 本地采集（LocalRegistry/LocalEpisodeStore）留在 rust_4x8 主仓库。
+//
+// 配置：分层加载（默认值 → TOML → CLI 覆盖）见 src/config.rs；--config-dump 可落盘快照。
+// 并发：主循环串行拉任务，批内 rayon 局级并行；上报异步化，计算与上传重叠（见 registry 头注释）。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use rayon::ThreadPoolBuilder;
 
+use banqi_collector::config::{CliOverrides, CollectorConfig};
 use banqi_collector::pipeline::self_play::{
-    AsDarkChessRef, GameEpisode, MatchParams, MatchResult, PlayerSpec, ScenarioType,
-    SeedableEnv, SelfPlayConfig, run_match_core,
+    AsDarkChessRef, GameEpisode, MatchParams, MatchResult, PlayerSpec, SeedableEnv,
+    SelfPlayConfig, run_match_core,
 };
-use banqi_collector::registry::{SchedulerConfig, SchedulerRegistry};
+use banqi_collector::registry::{
+    CLIENT_VERSION, EpisodeBatch, MatchReport, SchedulerRegistry,
+};
 use banqi_collector::registry::scheduler_registry::pb::TaskKind;
 use banqi_core::core::env::traits::GameEnv;
 use banqi_core::core::env::{
@@ -26,31 +30,14 @@ use banqi_core::core::env::{
 };
 use banqi_engine::inference::onnx::{OnnxModel, OnnxEvaluator};
 
+/// 无任务时的轮询退避
+const TASK_BACKOFF: Duration = Duration::from_secs(30);
+
 #[derive(Parser, Debug)]
 #[command(name = "banqi-collector", about = "分布式自对弈采集进程（scheduler backend）")]
 struct Args {
-    /// 调度器 gRPC 地址（http://host:port）
-    #[arg(long, default_value = "http://127.0.0.1:50051")]
-    scheduler_endpoint: String,
-    /// worker 标识
-    #[arg(long, default_value = "")]
-    worker_id: String,
-    /// 网络/模型本地缓存目录
-    #[arg(long, default_value = "outputs/distributed_cache")]
-    cache_dir: String,
-    /// 推理设备：cpu / auto
-    #[arg(long, default_value = "auto")]
-    device: String,
-    #[arg(long, default_value_t = 64)]
-    mcts_sims: usize,
-    #[arg(long, default_value_t = 16)]
-    max_considered_actions: usize,
-    /// 每批自对弈局数（单批上限）
-    #[arg(long, default_value_t = 64)]
-    games_per_iter: usize,
-    /// 自对弈线程数（默认 = CPU 核数）
-    #[arg(long, default_value_t = 0)]
-    threads: usize,
+    #[command(flatten)]
+    overrides: CliOverrides,
     /// 总批数上限（0 = 无限循环）
     #[arg(long, default_value_t = 0)]
     iterations: usize,
@@ -58,42 +45,40 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let config = SelfPlayConfig {
-        mcts_sims: args.mcts_sims,
-        max_considered_actions: args.max_considered_actions,
-        scenario: ScenarioType::Standard,
-        c_scale: 1.0,
-        gumbel_scale: 1.0,
-        playout_cap_random_enabled: false,
-        fast_mcts_sims: args.mcts_sims / 4,
-        full_search_prob: 0.25,
-        ..Default::default()
-    };
-    run_scheduler(args, config)
+    let cfg = CollectorConfig::load(&args.overrides)?;
+    let pool = build_pool(cfg.selfplay.threads)?;
+
+    println!("=== banqi-collector 启动（scheduler）v{CLIENT_VERSION} ===");
+    println!("生效配置：\n{}", cfg.to_toml()?);
+    println!(
+        "自对弈线程池 = {} 线程（variant 由服务端 GetTask 下发）",
+        pool.current_num_threads()
+    );
+    if let Some(path) = &args.overrides.config_dump {
+        cfg.dump_to(path)?;
+        println!("配置快照已写入: {}", path.display());
+    }
+
+    let mut registry = SchedulerRegistry::new(cfg.scheduler.clone())?;
+    run_scheduler(&args, &cfg.selfplay, &mut registry, &pool)?;
+
+    let failed = registry.failed_reports();
+    if failed > 0 {
+        eprintln!("⚠️ 本次运行有 {failed} 批上报失败，请检查网络与调度器日志");
+    }
+    Ok(())
 }
 
-fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
-    let pool = build_pool(args.threads)?;
-    let mut registry = SchedulerRegistry::new(SchedulerConfig {
-        endpoint: args.scheduler_endpoint.clone(),
-        worker_id: if args.worker_id.is_empty() {
-            format!("worker-{}", std::process::id())
-        } else {
-            args.worker_id.clone()
-        },
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        cache_dir: args.cache_dir.clone().into(),
-        device: args.device.clone(),
-    })?;
-
-    println!("=== banqi-collector 启动（scheduler） ===");
-    println!(
-        "endpoint={} cache={} threads={}（variant 由服务端 GetTask 下发）",
-        args.scheduler_endpoint, args.cache_dir, pool.current_num_threads()
-    );
-
-    const BACKOFF: Duration = Duration::from_secs(30);
+fn run_scheduler(
+    args: &Args,
+    base_selfplay: &SelfPlayConfig,
+    registry: &mut SchedulerRegistry,
+    pool: &rayon::ThreadPool,
+) -> Result<()> {
+    // 服务端下发的 mcts_sims 会覆盖本地值，故运行时持有可变副本
+    let mut selfplay = base_selfplay.clone();
     let mut iteration: usize = 0;
+
     while args.iterations == 0 || iteration < args.iterations {
         let task = match registry.get_task()? {
             Some(t) => {
@@ -101,35 +86,37 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                 t
             }
             None => {
-                std::thread::sleep(BACKOFF);
+                std::thread::sleep(TASK_BACKOFF);
                 continue;
             }
         };
 
-        // 服务端下发的 mcts_sims 覆盖本地值（0 = 不覆盖）
+        // 服务端下发覆盖本地值（0 = 不覆盖）；fast_mcts_sims 归零即按新值重新推导
         if task.mcts_sims > 0 {
-            config.mcts_sims = task.mcts_sims;
-            config.fast_mcts_sims = task.mcts_sims / 4;
+            selfplay.mcts_sims = task.mcts_sims;
+            selfplay.fast_mcts_sims = 0;
         }
 
         let started = Instant::now();
         match task.kind {
             TaskKind::TaskSelfplay => {
                 let model = registry.model(&task.network_sha)?;
+                // A/B 各持独立 ONNX 会话：OnnxModel 内部以 Mutex<Session> 串行化推理，
+                // 双方共用单会话会把双色对局压成单通道（实测吞吐约减半）。
+                let opponent = registry.opponent_model(&task.network_sha)?;
                 let result = run_variant_dispatch(
                     &task.variant,
                     task.initial_revealed,
-                    Arc::clone(&model),
-                    Arc::clone(&model),
-                    &config,
+                    model,
+                    opponent,
+                    &selfplay,
                     task.games,
                     true,
-                    &pool,
+                    pool,
                 )?;
-                let gz = episodes_gz(&result.episodes)?;
 
-                let total_steps: usize =
-                    result.episodes.iter().map(|e| e.game_length).sum();
+                let games = result.episodes.len();
+                let avg = avg_steps(&result.episodes);
                 // 批内聚合胜方（调度端仅作日志/统计用）
                 let winner = if result.wins > result.losses {
                     1
@@ -138,24 +125,20 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                 } else {
                     0
                 };
-                if let Err(e) = registry.report_episode(
-                    &task.task_id,
-                    &task.network_sha,
-                    result.episodes.len(),
-                    total_steps,
-                    winner,
-                    gz,
-                ) {
-                    eprintln!("[iter {iteration}] ⚠️ episode 上报失败（本批丢弃，继续拉任务）: {e}");
-                }
+
+                registry.add_completed_games(games);
                 println!(
-                    "[iter {iteration}] selfplay task={} 🎮 {} 局（步均 {:.1}）耗时 {:.1}s",
+                    "[iter {iteration}] selfplay task={} 🎮 {games} 局（步均 {avg:.1}）计算耗时 {:.1}s",
                     task.task_id,
-                    result.episodes.len(),
-                    avg_steps(&result.episodes),
                     started.elapsed().as_secs_f64()
                 );
-                registry.add_completed_games(result.episodes.len());
+                // 异步上报：序列化/gzip/sha256/R2 直传都在后台，主循环立刻进入下一批
+                registry.submit_episode_report(EpisodeBatch {
+                    task_id: task.task_id.clone(),
+                    network_sha: task.network_sha.clone(),
+                    winner,
+                    episodes: result.episodes,
+                });
             }
             TaskKind::TaskRating => {
                 let candidate = registry.model(&task.network_sha)?;
@@ -167,50 +150,49 @@ fn run_scheduler(args: Args, mut config: SelfPlayConfig) -> Result<()> {
                     task.initial_revealed,
                     candidate,
                     opponent,
-                    &config,
+                    &selfplay,
                     n,
                     false,
-                    &pool,
+                    pool,
                 )?;
                 let pairs = pairs_from_outcomes(&result.game_outcomes);
                 println!(
-                    "[iter {iteration}] rating task={} games={} w/l/d={}/{}/{} pairs={:?} 耗时 {:.1}s",
+                    "[iter {iteration}] rating task={} games={n} w/l/d={}/{}/{} pairs={pairs:?} 计算耗时 {:.1}s",
                     task.task_id,
-                    n,
                     result.wins,
                     result.losses,
                     result.draws,
-                    pairs,
                     started.elapsed().as_secs_f64()
                 );
                 registry.add_completed_games(n);
-                if let Err(e) = registry.report_match_result(
-                    &task.task_id,
-                    &task.network_sha,
-                    &task.opponent_sha,
-                    n,
-                    result.wins,
-                    result.losses,
-                    result.draws,
+                registry.submit_match_report(MatchReport {
+                    task_id: task.task_id.clone(),
+                    network_sha: task.network_sha.clone(),
+                    opponent_sha: task.opponent_sha.clone(),
+                    games: n,
+                    wins: result.wins,
+                    losses: result.losses,
+                    draws: result.draws,
                     pairs,
-                ) {
-                    eprintln!(
-                        "[iter {iteration}] ⚠️ rating 结果上报被拒（对局已判停或已由其他 worker 完成）: {e}"
-                    );
-                }
+                });
             }
             TaskKind::TaskNone => unreachable!("get_task 已过滤 TASK_NONE"),
         }
         iteration += 1;
     }
+
+    // 退出前等待在途上报落地（背压信号量全部可用即表示无在途任务）
+    registry.flush_reports();
     Ok(())
 }
 
+/// 自对弈线程池：`threads = 0` 取 CPU 核数。
 fn build_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    let threads = if threads > 0 { threads } else { num_cpus::get() };
     ThreadPoolBuilder::new()
-        .num_threads(if threads > 0 { threads } else { num_cpus::get() })
+        .num_threads(threads)
         .build()
-        .context("构建 rayon 线程池失败")
+        .with_context(|| format!("构建 rayon 线程池失败（threads={threads}）"))
 }
 
 fn avg_steps(episodes: &[GameEpisode]) -> f64 {
@@ -284,17 +266,6 @@ where
         anyhow::bail!("自对弈 0 局产出（检查模型与配置）");
     }
     Ok(result)
-}
-
-/// episodes 序列化为 jsonl.gz 内存块（与 LocalEpisodeStore 行格式一致）。
-fn episodes_gz(episodes: &[GameEpisode]) -> Result<Vec<u8>> {
-    use banqi_collector::pipeline::self_play::serialize::episode_to_dict_json;
-    use std::io::Write;
-    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-    for ep in episodes {
-        writeln!(gz, "{}", episode_to_dict_json(ep)).context("序列化 episode 失败")?;
-    }
-    gz.finish().context("gzip 收尾失败")
 }
 
 /// 从逐局结果推导五项成对计数（换色配对：i 与 i+1 一组，均为 candidate 视角）。

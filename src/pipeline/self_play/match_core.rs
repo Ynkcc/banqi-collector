@@ -471,7 +471,7 @@ where
         let step_sims = if is_full_search {
             config.mcts_sims
         } else {
-            config.fast_mcts_sims
+            config.fast_sims()
         };
 
         let mut step_gumbel_cfg = gumbel_cfg.clone();

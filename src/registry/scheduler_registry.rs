@@ -5,9 +5,18 @@
 //
 // 语义：get_task（= GetTask，无任务返回 None 由调用方退避轮询）、
 // model（= ensure_model，按 sha 惰性下载 + 加载 onnx，进程内缓存）、
-// report_episode（ReportEpisode 签发预签名 PUT → HTTP 直传 R2）、
-// report_match_result（rating 五项计数上报，服务端 GSPRT 判停晋级）。
+// submit_episode_report（ReportEpisode 签发预签名 PUT → HTTP 直传 R2）、
+// submit_match_report（rating 五项计数上报，服务端 GSPRT 判停晋级）。
 // 模型换网感知：GetTask 返回的 best sha 变化即触发新模型下载加载。
+//
+// 并发形态（2026-09-15 重构）：
+// - 长连接：`Channel` 只建一次并复用（原先每次 RPC 都重新 connect），
+//   tonic 的 Channel 自带重连，调度器重启后无需额外处理。
+// - 异步上报：gRPC + JSON 序列化 + gzip + sha256 + R2 PUT 全部丢到后台 tokio 任务，
+//   主循环（拉任务 → rayon 跑批）不再被 I/O 阻塞，计算与上传重叠。
+// - 背压：`report_slots` 信号量限制在途批数（同时约束驻留内存），名额用尽时
+//   提交侧阻塞，主循环自然不会再拉下一批。
+// - 模型预取：心跳发现 best 变化即在后台下载到缓存目录，下次 GetTask 直接命中。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,10 +25,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tonic::transport::Channel;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tonic::transport::{Channel, Endpoint};
 
 use banqi_engine::inference::onnx::OnnxModel;
+
+use crate::pipeline::self_play::GameEpisode;
 
 pub mod pb {
     tonic::include_proto!("scheduler");
@@ -31,13 +46,34 @@ use pb::{EpisodeMeta, HeartbeatRequest, MatchResult as PbMatchResult, NetworkReq
 /// 心跳间隔
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-#[derive(Clone)]
+/// HTTP 超时（模型下载 / R2 直传）
+const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 客户端版本声明（来自 crate 版本，不作为配置项）
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SchedulerConfig {
     pub endpoint: String,
+    /// worker 标识（空 = 由配置层填 `worker-<pid>`）
     pub worker_id: String,
-    pub client_version: String,
     pub cache_dir: PathBuf,
     pub device: String,
+    /// 允许同时在途的上报批数（背压上限；同时约束驻留内存）
+    pub max_inflight_reports: usize,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:50051".to_string(),
+            worker_id: String::new(),
+            cache_dir: PathBuf::from("outputs/distributed_cache"),
+            device: "auto".to_string(),
+            max_inflight_reports: 2,
+        }
+    }
 }
 
 /// 一次 GetTask 得到的任务（分布式形态，参数由服务端下发）。
@@ -54,47 +90,104 @@ pub struct SchedulerTask {
     pub initial_revealed: Option<usize>,
 }
 
+/// 一批自对弈 episode 的上报载荷（序列化/gzip/sha256 在后台完成）。
+pub struct EpisodeBatch {
+    pub task_id: String,
+    pub network_sha: String,
+    /// 批内聚合胜方（1 红 / -1 黑 / 0 平；调度端仅作日志统计）
+    pub winner: i32,
+    pub episodes: Vec<GameEpisode>,
+}
+
+/// rating 结果上报载荷（五项成对计数）。
+pub struct MatchReport {
+    pub task_id: String,
+    pub network_sha: String,
+    pub opponent_sha: String,
+    pub games: usize,
+    pub wins: usize,
+    pub losses: usize,
+    pub draws: usize,
+    pub pairs: [usize; 5],
+}
+
 pub struct SchedulerRegistry {
     rt: tokio::runtime::Runtime,
+    /// 与调度器的长连接（clone 廉价，tonic 内部自动重连）
+    channel: Channel,
     http: reqwest::Client,
     cfg: SchedulerConfig,
-    /// 本地已加载的模型缓存（sha -> 模型）
+    /// 本地已加载的模型缓存（sha -> 主会话）
     models: HashMap<String, Arc<OnnxModel>>,
+    /// 自对弈对手侧的独立会话缓存（sha -> 第二会话），见 `opponent_model`。
+    opponent_models: HashMap<String, Arc<OnnxModel>>,
     /// 当前持有的网络 sha（GetTask 时上报，服务端据此免发下载 URL）
     current_network: String,
     /// 心跳共享状态：累计完成局数
     completed_games: Arc<AtomicU64>,
     /// 心跳共享状态：当前执行中的 task_id
     running_task_id: Arc<Mutex<String>>,
+    /// 在途上报名额（背压；同时约束驻留内存）
+    report_slots: Arc<Semaphore>,
+    report_slots_total: u32,
+    /// 累计上报失败批数（进程退出时汇总）
+    failed_reports: Arc<AtomicU64>,
+    /// 网络下载临时文件名去重计数
+    tmp_seq: Arc<AtomicU64>,
 }
 
 impl SchedulerRegistry {
     pub fn new(cfg: SchedulerConfig) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(2)
             .enable_all()
             .build()
             .context("构建 tokio runtime 失败")?;
+
+        let channel = rt.block_on(async {
+            Endpoint::from_shared(cfg.endpoint.clone())
+                .with_context(|| format!("非法调度器地址: {}", cfg.endpoint))?
+                .connect()
+                .await
+                .with_context(|| format!("连接调度器失败: {}", cfg.endpoint))
+        })?;
+
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(HTTP_TIMEOUT)
             .build()
             .context("构建 HTTP 客户端失败")?;
+
+        let report_slots_total = cfg.max_inflight_reports as u32;
+        let report_slots = Arc::new(Semaphore::new(cfg.max_inflight_reports));
         let completed_games = Arc::new(AtomicU64::new(0));
         let running_task_id = Arc::new(Mutex::new(String::new()));
+        let failed_reports = Arc::new(AtomicU64::new(0));
+        let tmp_seq = Arc::new(AtomicU64::new(0));
+
         spawn_heartbeat(
             rt.handle().clone(),
+            channel.clone(),
             cfg.clone(),
+            http.clone(),
+            Arc::clone(&tmp_seq),
             Arc::clone(&completed_games),
             Arc::clone(&running_task_id),
         );
+
         Ok(Self {
             rt,
+            channel,
             http,
             cfg,
             models: HashMap::new(),
+            opponent_models: HashMap::new(),
             current_network: String::new(),
             completed_games,
             running_task_id,
+            report_slots,
+            report_slots_total,
+            failed_reports,
+            tmp_seq,
         })
     }
 
@@ -108,21 +201,86 @@ impl SchedulerRegistry {
         self.completed_games.fetch_add(n as u64, Ordering::Relaxed);
     }
 
-    fn connect(&self) -> Result<SchedulerServiceClient<Channel>> {
-        let client = self
+    /// 累计上报失败批数
+    pub fn failed_reports(&self) -> u64 {
+        self.failed_reports.load(Ordering::Relaxed)
+    }
+
+    fn client(&self) -> SchedulerServiceClient<Channel> {
+        SchedulerServiceClient::new(self.channel.clone())
+    }
+
+    /// 获取一个在途上报名额；名额用尽则阻塞主线程直到有上报完成（背压）。
+    fn acquire_report_slot(&self) -> OwnedSemaphorePermit {
+        let slots = Arc::clone(&self.report_slots);
+        self.rt
+            .block_on(slots.acquire_owned())
+            .expect("上报信号量不会被关闭")
+    }
+
+    /// 等待全部在途上报结束（进程退出前调用，避免丢数据）。
+    pub fn flush_reports(&self) {
+        let slots = Arc::clone(&self.report_slots);
+        let total = self.report_slots_total;
+        // 持有全部名额即代表在途上报已清空；随后 drop 立即释放。
+        let _all = self
             .rt
-            .block_on(SchedulerServiceClient::connect(self.cfg.endpoint.clone()))
-            .with_context(|| format!("连接调度器失败: {}", self.cfg.endpoint))?;
-        Ok(client)
+            .block_on(slots.acquire_many_owned(total))
+            .expect("上报信号量不会被关闭");
+    }
+
+    /// 提交一批 episode 上报：立即返回，序列化与网络传输在后台 tokio 任务中完成。
+    pub fn submit_episode_report(&self, batch: EpisodeBatch) {
+        let permit = self.acquire_report_slot();
+        let http = self.http.clone();
+        let mut client = self.client();
+        let worker_id = self.cfg.worker_id.clone();
+        let task_id = batch.task_id.clone();
+        let failed_reports = Arc::clone(&self.failed_reports);
+
+        self.rt.spawn(async move {
+            let _permit = permit;
+            match report_episode_async(&http, &mut client, &worker_id, batch).await {
+                Ok((games, steps, object_key)) => println!(
+                    "[scheduler] ✅ episode 已直传: task={task_id} games={games} steps={steps} -> {object_key}"
+                ),
+                Err(e) => {
+                    failed_reports.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[scheduler] ⚠️ episode 上报失败（本批丢弃）: task={task_id} {e:#}");
+                }
+            }
+        });
+    }
+
+    /// 提交 rating 结果上报（报文很小，同样异步，主线程不等待网络）。
+    pub fn submit_match_report(&self, rep: MatchReport) {
+        let permit = self.acquire_report_slot();
+        let mut client = self.client();
+        let worker_id = self.cfg.worker_id.clone();
+        let task_id = rep.task_id.clone();
+        let failed_reports = Arc::clone(&self.failed_reports);
+
+        self.rt.spawn(async move {
+            let _permit = permit;
+            match report_match_async(&mut client, &worker_id, rep).await {
+                Ok((concluded, promoted, best)) => println!(
+                    "[scheduler] ✅ match result: task={task_id} concluded={concluded} promoted={promoted} best={best}"
+                ),
+                Err(e) => {
+                    failed_reports.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[scheduler] ⚠️ rating 结果上报失败（本批丢弃）: task={task_id} {e:#}");
+                }
+            }
+        });
     }
 
     /// 拉取任务；TASK_NONE（无任务/版本过旧）返回 None，由调用方退避轮询。
     /// 返回 Some 时主网络（rating 任务时含对手网络）已确保就绪于本地缓存。
     pub fn get_task(&mut self) -> Result<Option<SchedulerTask>> {
-        let mut client = self.connect()?;
+        let mut client = self.client();
         let req = TaskRequest {
             worker_id: self.cfg.worker_id.clone(),
-            client_version: self.cfg.client_version.clone(),
+            client_version: CLIENT_VERSION.to_string(),
             threads: num_cpus::get() as i32,
             memory_mb: available_memory_mb(),
             current_network: self.current_network.clone(),
@@ -184,7 +342,7 @@ impl SchedulerRegistry {
     /// 下载（若本地缓存缺失）指定 sha 的网络文件，并更新 current_network。
     /// SRI 完整性校验：缓存命中与下载后都做 sha256 比对，不符则删除缓存并拒绝使用。
     fn ensure_downloaded(&mut self, sha: &str, url: &str) -> Result<()> {
-        let path = self.network_path(sha);
+        let path = network_path(&self.cfg.cache_dir, sha);
         if path.is_file() {
             if let Err(e) = verify_file_sha256(&path, sha) {
                 println!(
@@ -198,36 +356,12 @@ impl SchedulerRegistry {
             if url.is_empty() {
                 anyhow::bail!("网络 {sha} 本地无缓存且服务端未下发下载 URL");
             }
-            self.download(url, &path)
+            self.rt
+                .block_on(download(&self.http, url, &path, sha, &self.tmp_seq))
                 .with_context(|| format!("下载网络失败: {sha}"))?;
-            if let Err(e) = verify_file_sha256(&path, sha) {
-                let _ = std::fs::remove_file(&path);
-                return Err(anyhow::anyhow!("下载的网络 SRI 校验失败 (sha={sha}): {e:#}"));
-            }
-            println!("[scheduler] ✅ 网络已下载并校验: {} -> {}", sha, path.display());
+            println!("[scheduler] ✅ 网络已下载并校验: {sha} -> {}", path.display());
         }
         self.current_network = sha.to_string();
-        Ok(())
-    }
-
-    fn network_path(&self, sha: &str) -> PathBuf {
-        // 与 Go 侧 r2.NetworkKey 对应的本地缓存布局: cache_dir/networks/<sha>.bin
-        self.cfg.cache_dir.join("networks").join(format!("{sha}.bin"))
-    }
-
-    fn download(&self, url: &str, to: &PathBuf) -> Result<()> {
-        let bytes = self
-            .rt
-            .block_on(async {
-                self.http.get(url).send().await?.error_for_status()?.bytes().await
-            })
-            .with_context(|| format!("HTTP 下载失败: {url}"))?;
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("创建目录失败: {}", parent.display()))?;
-        }
-        let tmp = to.with_extension("tmp");
-        std::fs::write(&tmp, &bytes).with_context(|| format!("写临时文件失败: {}", tmp.display()))?;
-        std::fs::rename(&tmp, to).with_context(|| format!("原子替换失败: {}", to.display()))?;
         Ok(())
     }
 
@@ -236,112 +370,38 @@ impl SchedulerRegistry {
         if let Some(m) = self.models.get(sha) {
             return Ok(Arc::clone(m));
         }
-        let path = self.network_path(sha);
-        let model = Arc::new(OnnxModel::new(
-            &path.display().to_string(),
-            &self.cfg.device,
-        )
-        .map_err(|e| anyhow::anyhow!("加载 onnx 失败 ({sha}): {e}"))?);
+        let model = self.load_model(sha)?;
         self.models.insert(sha.to_string(), Arc::clone(&model));
         Ok(model)
     }
 
-    /// 上报一批 episode：元数据 → 预签名 PUT，数据直传 R2。
-    pub fn report_episode(
-        &self,
-        task_id: &str,
-        network_sha: &str,
-        game_count: usize,
-        total_steps: usize,
-        winner: i32,
-        gz_body: Vec<u8>,
-    ) -> Result<()> {
-        let content_sha256 = hex_sha256(&gz_body);
-        let content_length = gz_body.len() as i64;
-        let worker_id = self.cfg.worker_id.clone();
-        let mut client = self.connect()?;
-        let ack = self
-            .rt
-            .block_on(async move {
-                let meta = EpisodeMeta {
-                    worker_id,
-                    task_id: task_id.to_string(),
-                    game_count: game_count as i32,
-                    total_steps: total_steps as i32,
-                    winner,
-                    network_sha: network_sha.to_string(),
-                    timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64,
-                    content_length,
-                    content_sha256,
-                };
-                client.report_episode(meta).await
-            })
-            .with_context(|| "ReportEpisode 调用失败".to_string())?
-            .into_inner();
-        if !ack.accepted {
-            anyhow::bail!("episode 被拒绝: {}", ack.message);
+    /// 返回指定 sha 的第二个独立推理会话，供自对弈 A/B 分别持有。
+    ///
+    /// `OnnxModel` 内部以 `Mutex<Session>` 串行化推理（见 banqi-engine），双方共用
+    /// 单个会话时双色对局的推理会挤在同一条通道上排队，批量自对弈吞吐约减半；
+    /// 老侧 `run_native_match` 为每方各建一个会话，此处与之对齐。
+    pub fn opponent_model(&mut self, sha: &str) -> Result<Arc<OnnxModel>> {
+        if let Some(m) = self.opponent_models.get(sha) {
+            return Ok(Arc::clone(m));
         }
-        self.upload(&ack.upload_url, gz_body)
-            .with_context(|| format!("直传 R2 失败: {}", ack.object_key))?;
-        println!(
-            "[scheduler] ✅ episode 已直传: games={game_count} steps={total_steps} -> {}",
-            ack.object_key
-        );
-        Ok(())
+        let model = self.load_model(sha)?;
+        self.opponent_models.insert(sha.to_string(), Arc::clone(&model));
+        Ok(model)
     }
 
-    /// 上报 rating 结果（五项成对计数），返回服务端判停结论。
-    pub fn report_match_result(
-        &self,
-        task_id: &str,
-        network_sha: &str,
-        opponent_sha: &str,
-        games: usize,
-        wins: usize,
-        losses: usize,
-        draws: usize,
-        pairs: [usize; 5],
-    ) -> Result<(bool, bool, String)> {
-        let mut client = self.connect()?;
-        let ack = self
-            .rt
-            .block_on(async move {
-                let req = PbMatchResult {
-                    worker_id: self.cfg.worker_id.clone(),
-                    task_id: task_id.to_string(),
-                    kind: TaskKind::TaskRating as i32,
-                    network_sha: network_sha.to_string(),
-                    opponent_sha: opponent_sha.to_string(),
-                    games: games as i32,
-                    wins: wins as i32,
-                    losses: losses as i32,
-                    draws: draws as i32,
-                    pair_ll: pairs[0] as i32,
-                    pair_ld: pairs[1] as i32,
-                    pair_dd: pairs[2] as i32,
-                    pair_dw: pairs[3] as i32,
-                    pair_ww: pairs[4] as i32,
-                };
-                client.report_match_result(req).await
-            })
-            .with_context(|| "ReportMatchResult 调用失败".to_string())?
-            .into_inner();
-        if !ack.accepted {
-            anyhow::bail!("match result 被拒绝: {}", ack.message);
-        }
-        println!(
-            "[scheduler] match result: concluded={} promoted={} best={}",
-            ack.match_concluded, ack.promoted, ack.best_sha
-        );
-        Ok((ack.match_concluded, ack.promoted, ack.best_sha))
+    /// 从本地缓存文件加载一个新的 ONNX 会话（不做缓存，由调用方决定归属）。
+    fn load_model(&self, sha: &str) -> Result<Arc<OnnxModel>> {
+        let path = network_path(&self.cfg.cache_dir, sha);
+        Ok(Arc::new(OnnxModel::new(
+            &path.display().to_string(),
+            &self.cfg.device,
+        )
+        .map_err(|e| anyhow::anyhow!("加载 onnx 失败 ({sha}): {e}"))?))
     }
 
-    /// trainer 侧注册新网络（本进程通常不调用；供复用/调试）。
+    /// 查询当前 best 网络（供复用/调试）。
     pub fn get_best_network(&self) -> Result<Option<(String, String)>> {
-        let mut client = self.connect()?;
+        let mut client = self.client();
         let info = self
             .rt
             .block_on(async move { client.get_network(NetworkRequest { sha: String::new() }).await })
@@ -349,19 +409,267 @@ impl SchedulerRegistry {
             .into_inner();
         Ok(Some((info.sha, info.download_url)))
     }
+}
 
-    fn upload(&self, url: &str, body: Vec<u8>) -> Result<()> {
-        if url.is_empty() {
-            anyhow::bail!("预签名 PUT URL 为空");
-        }
-        self.rt
-            .block_on(async {
-                self.http.put(url).body(body).send().await?.error_for_status()?;
-                Ok::<_, reqwest::Error>(())
-            })
-            .with_context(|| format!("HTTP PUT 失败: {url}"))?;
-        Ok(())
+// ============================================================================
+// 异步上报
+// ============================================================================
+
+async fn report_episode_async(
+    http: &reqwest::Client,
+    client: &mut SchedulerServiceClient<Channel>,
+    worker_id: &str,
+    batch: EpisodeBatch,
+) -> Result<(usize, usize, String)> {
+    let game_count = batch.episodes.len();
+    let total_steps: usize = batch.episodes.iter().map(|e| e.game_length).sum();
+
+    // JSON 序列化 + gzip 是 CPU 密集段，放到 blocking 线程池，避免占住 tokio worker。
+    let episodes = batch.episodes;
+    let gz_body = tokio::task::spawn_blocking(move || episodes_gz(&episodes))
+        .await
+        .context("episode 序列化任务异常退出")??;
+
+    let meta = EpisodeMeta {
+        worker_id: worker_id.to_string(),
+        task_id: batch.task_id,
+        game_count: game_count as i32,
+        total_steps: total_steps as i32,
+        winner: batch.winner,
+        network_sha: batch.network_sha,
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        content_length: gz_body.len() as i64,
+        content_sha256: hex_sha256(&gz_body),
+    };
+
+    let ack = client
+        .report_episode(meta)
+        .await
+        .context("ReportEpisode 调用失败")?
+        .into_inner();
+    if !ack.accepted {
+        anyhow::bail!("episode 被拒绝: {}", ack.message);
     }
+
+    let object_key = ack.object_key.clone();
+    upload(http, &ack.upload_url, gz_body)
+        .await
+        .with_context(|| format!("直传 R2 失败: {object_key}"))?;
+    Ok((game_count, total_steps, ack.object_key))
+}
+
+async fn report_match_async(
+    client: &mut SchedulerServiceClient<Channel>,
+    worker_id: &str,
+    rep: MatchReport,
+) -> Result<(bool, bool, String)> {
+    let ack = client
+        .report_match_result(PbMatchResult {
+            worker_id: worker_id.to_string(),
+            task_id: rep.task_id,
+            kind: TaskKind::TaskRating as i32,
+            network_sha: rep.network_sha,
+            opponent_sha: rep.opponent_sha,
+            games: rep.games as i32,
+            wins: rep.wins as i32,
+            losses: rep.losses as i32,
+            draws: rep.draws as i32,
+            pair_ll: rep.pairs[0] as i32,
+            pair_ld: rep.pairs[1] as i32,
+            pair_dd: rep.pairs[2] as i32,
+            pair_dw: rep.pairs[3] as i32,
+            pair_ww: rep.pairs[4] as i32,
+        })
+        .await
+        .context("ReportMatchResult 调用失败")?
+        .into_inner();
+    if !ack.accepted {
+        anyhow::bail!("match result 被拒绝: {}", ack.message);
+    }
+    Ok((ack.match_concluded, ack.promoted, ack.best_sha))
+}
+
+async fn upload(http: &reqwest::Client, url: &str, body: Vec<u8>) -> Result<()> {
+    if url.is_empty() {
+        anyhow::bail!("预签名 PUT URL 为空");
+    }
+    http.put(url)
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("HTTP PUT 请求失败: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP PUT 返回错误状态: {url}"))?;
+    Ok(())
+}
+
+// ============================================================================
+// 网络缓存
+// ============================================================================
+
+fn network_path(cache_dir: &Path, sha: &str) -> PathBuf {
+    // 与 Go 侧 r2.NetworkKey 对应的本地缓存布局: cache_dir/networks/<sha>.bin
+    cache_dir.join("networks").join(format!("{sha}.bin"))
+}
+
+/// 预签名 GET → 临时文件 → 原子替换 → sha256 校验。
+/// 临时文件名带 pid/序号，避免与后台预取的同名写入互相踩踏。
+async fn download(
+    http: &reqwest::Client,
+    url: &str,
+    to: &Path,
+    expect_sha: &str,
+    tmp_seq: &AtomicU64,
+) -> Result<()> {
+    let bytes = http
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("HTTP GET 请求失败: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP GET 返回错误状态: {url}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("读取下载内容失败: {url}"))?;
+
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+    }
+    let seq = tmp_seq.fetch_add(1, Ordering::Relaxed);
+    let tmp = to.with_extension(format!("{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&tmp, &bytes).with_context(|| format!("写临时文件失败: {}", tmp.display()))?;
+    std::fs::rename(&tmp, to).with_context(|| format!("原子替换失败: {}", to.display()))?;
+
+    if let Err(e) = verify_file_sha256(to, expect_sha) {
+        let _ = std::fs::remove_file(to);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// SRI：文件内容 sha256 是否等于期望的 hex sha（大小写不敏感）。
+fn verify_file_sha256(path: &Path, expect_sha: &str) -> Result<()> {
+    let data = std::fs::read(path).with_context(|| format!("读取网络文件失败: {}", path.display()))?;
+    let actual = hex_sha256(&data);
+    if !actual.eq_ignore_ascii_case(expect_sha) {
+        anyhow::bail!("sha256 不匹配: 期望 {expect_sha} 实际 {actual}");
+    }
+    Ok(())
+}
+
+// ============================================================================
+// 后台任务
+// ============================================================================
+
+/// 后台心跳：周期上报版本声明/资源/进度，感知 best 网络变化与暂停指令。
+/// best 变化时顺带在后台预取该网络，把下载从主循环里挪走。
+fn spawn_heartbeat(
+    handle: tokio::runtime::Handle,
+    channel: Channel,
+    cfg: SchedulerConfig,
+    http: reqwest::Client,
+    tmp_seq: Arc<AtomicU64>,
+    completed_games: Arc<AtomicU64>,
+    running_task_id: Arc<Mutex<String>>,
+) {
+    handle.spawn(async move {
+        let mut last_best = String::new();
+        loop {
+            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+            let req = HeartbeatRequest {
+                worker_id: cfg.worker_id.clone(),
+                current_threads: num_cpus::get() as i32,
+                completed_games: completed_games.load(Ordering::Relaxed) as i32,
+                running_task_id: running_task_id.lock().unwrap().clone(),
+                client_version: CLIENT_VERSION.to_string(),
+                memory_mb: available_memory_mb(),
+            };
+            let mut client = SchedulerServiceClient::new(channel.clone());
+            match client.heartbeat(req).await.map(|r| r.into_inner()) {
+                Ok(reply) => {
+                    if reply.pause_self_play {
+                        println!("[heartbeat] ⏸️ 服务端下发 pause_self_play");
+                    }
+                    if !reply.best_network.is_empty() && reply.best_network != last_best {
+                        if !last_best.is_empty() {
+                            println!(
+                                "[heartbeat] 🔄 best 网络变化: {last_best} -> {}（后台预取）",
+                                reply.best_network
+                            );
+                        }
+                        last_best = reply.best_network.clone();
+                        prefetch_network(
+                            &http,
+                            &cfg,
+                            channel.clone(),
+                            Arc::clone(&tmp_seq),
+                            reply.best_network,
+                        );
+                    }
+                }
+                Err(status) => {
+                    println!("[heartbeat] 上报失败（将重试）: {status}");
+                }
+            }
+        }
+    });
+}
+
+/// 后台预取 best 网络：命中本地缓存直接跳过，否则 GetNetwork 取 URL 后下载并校验。
+/// 主路径 `ensure_downloaded` 命中后只做 sha256 校验，换网不再阻塞采集。
+fn prefetch_network(
+    http: &reqwest::Client,
+    cfg: &SchedulerConfig,
+    channel: Channel,
+    tmp_seq: Arc<AtomicU64>,
+    sha: String,
+) {
+    let http = http.clone();
+    let cfg = cfg.clone();
+    tokio::spawn(async move {
+        let path = network_path(&cfg.cache_dir, &sha);
+        if path.is_file() {
+            return;
+        }
+        let mut client = SchedulerServiceClient::new(channel);
+        let info = match client
+            .get_network(NetworkRequest { sha: String::new() })
+            .await
+            .map(|r| r.into_inner())
+        {
+            Ok(info) => info,
+            Err(e) => {
+                println!("[prefetch] ⚠️ 获取 best 网络信息失败: {e}");
+                return;
+            }
+        };
+        if info.sha != sha || info.download_url.is_empty() {
+            return;
+        }
+        match download(&http, &info.download_url, &path, &sha, &tmp_seq).await {
+            Ok(()) => println!("[prefetch] ✅ 已预取 best 网络: {sha}"),
+            Err(e) => println!("[prefetch] ⚠️ 预取 best 网络失败（主路径将重试）: {sha} {e:#}"),
+        }
+    });
+}
+
+// ============================================================================
+// 工具
+// ============================================================================
+
+/// episodes 序列化为 jsonl.gz 内存块（与 LocalEpisodeStore 行格式一致）。
+fn episodes_gz(episodes: &[GameEpisode]) -> Result<Vec<u8>> {
+    use crate::pipeline::self_play::serialize::episode_to_dict_json;
+    use std::io::Write;
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    for ep in episodes {
+        writeln!(gz, "{}", episode_to_dict_json(ep)).context("序列化 episode 失败")?;
+    }
+    gz.finish().context("gzip 收尾失败")
 }
 
 fn hex_sha256(data: &[u8]) -> String {
@@ -386,16 +694,6 @@ fn parse_extra_config(json: &str) -> Option<usize> {
     Some(n)
 }
 
-/// SRI：文件内容 sha256 是否等于期望的 hex sha（大小写不敏感）。
-fn verify_file_sha256(path: &Path, expect_sha: &str) -> Result<()> {
-    let data = std::fs::read(path).with_context(|| format!("读取网络文件失败: {}", path.display()))?;
-    let actual = hex_sha256(&data);
-    if !actual.eq_ignore_ascii_case(expect_sha) {
-        anyhow::bail!("sha256 不匹配: 期望 {expect_sha} 实际 {actual}");
-    }
-    Ok(())
-}
-
 /// 可用内存（MB）：Linux 读 /proc/meminfo MemAvailable，失败返回 0。
 fn available_memory_mb() -> i64 {
     let Ok(s) = std::fs::read_to_string("/proc/meminfo") else {
@@ -408,48 +706,4 @@ fn available_memory_mb() -> i64 {
         }
     }
     0
-}
-
-/// 后台心跳：周期上报版本声明/资源/进度，日志感知 best 网络变化与暂停指令。
-fn spawn_heartbeat(
-    handle: tokio::runtime::Handle,
-    cfg: SchedulerConfig,
-    completed_games: Arc<AtomicU64>,
-    running_task_id: Arc<Mutex<String>>,
-) {
-    handle.spawn(async move {
-        let mut last_best = String::new();
-        loop {
-            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-            let req = HeartbeatRequest {
-                worker_id: cfg.worker_id.clone(),
-                current_threads: num_cpus::get() as i32,
-                completed_games: completed_games.load(Ordering::Relaxed) as i32,
-                running_task_id: running_task_id.lock().unwrap().clone(),
-                client_version: cfg.client_version.clone(),
-                memory_mb: available_memory_mb(),
-            };
-            let result = match SchedulerServiceClient::connect(cfg.endpoint.clone()).await {
-                Ok(mut client) => client.heartbeat(req).await.map(|r| r.into_inner()),
-                Err(e) => Err(tonic::Status::unknown(format!("connect: {e}"))),
-            };
-            match result {
-                Ok(reply) => {
-                    if !last_best.is_empty() && reply.best_network != last_best {
-                        println!(
-                            "[heartbeat] 🔄 best 网络变化: {last_best} -> {}（下次 GetTask 生效）",
-                            reply.best_network
-                        );
-                    }
-                    if reply.pause_self_play {
-                        println!("[heartbeat] ⏸️ 服务端下发 pause_self_play");
-                    }
-                    last_best = reply.best_network;
-                }
-                Err(status) => {
-                    println!("[heartbeat] 上报失败（将重试）: {status}");
-                }
-            }
-        }
-    });
 }

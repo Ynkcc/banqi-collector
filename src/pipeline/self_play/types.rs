@@ -106,7 +106,8 @@ pub struct GameEpisode {
 ///
 /// 预留扩展点：未来可实现特定残局/开局场景 (如 TwoAdvisors, HiddenThreats)。
 /// 目前所有场景均退化为标准开局。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScenarioType {
     /// 场景1: 双士残局 (R_A vs B_A) — 未实现，回退为 Standard
     TwoAdvisors,
@@ -142,7 +143,8 @@ impl ScenarioType {
 // ================ 自对弈配置 ================
 
 /// 自对弈配置
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SelfPlayConfig {
     /// 每次决策执行的 MCTS 模拟次数
     pub mcts_sims: usize,
@@ -166,7 +168,7 @@ pub struct SelfPlayConfig {
     pub gumbel_scale: f32,
     /// 是否启用算力分配随机化 (Playout Cap Randomization)
     pub playout_cap_random_enabled: bool,
-    /// Fast Search 模拟次数 (如 16)
+    /// Fast Search 模拟次数；0 = 由 mcts_sims 推导（见 `fast_sims()`）
     pub fast_mcts_sims: usize,
     /// Full Search 出现概率 (如 0.25)
     pub full_search_prob: f32,
@@ -178,6 +180,8 @@ pub struct SelfPlayConfig {
     pub health_confidence_exp: f32,
     /// 是否在记录 Episode 时同步收集 NNUE 稀疏特征（供 NNUE 训练管道）
     pub collect_nnue_features: bool,
+    /// 自对弈线程数（0 = CPU 核数）；只被采集进程用于建 rayon 线程池
+    pub threads: usize,
 }
 
 impl Default for SelfPlayConfig {
@@ -188,13 +192,25 @@ impl Default for SelfPlayConfig {
             scenario: ScenarioType::Standard,
             c_scale: 1.0,
             gumbel_scale: 1.0,
-            playout_cap_random_enabled: true,
-            fast_mcts_sims: 16,
+            playout_cap_random_enabled: false,
+            fast_mcts_sims: 0,
             full_search_prob: 0.25,
             health_enabled: false,
             health_weight: 0.0,
             health_confidence_exp: 0.0,
             collect_nnue_features: false,
+            threads: 0,
+        }
+    }
+}
+
+impl SelfPlayConfig {
+    /// Fast Search 的模拟次数：`fast_mcts_sims = 0` 时按 `mcts_sims / 4` 推导（至少 1）。
+    pub fn fast_sims(&self) -> usize {
+        if self.fast_mcts_sims == 0 {
+            (self.mcts_sims / 4).max(1)
+        } else {
+            self.fast_mcts_sims
         }
     }
 }
@@ -271,7 +287,7 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
             let step_sims = if is_full_search {
                 self.config.mcts_sims
             } else {
-                self.config.fast_mcts_sims
+                self.config.fast_sims()
             };
 
             let step_mcts_config = GumbelConfig {
