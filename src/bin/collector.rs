@@ -45,14 +45,19 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg = CollectorConfig::load(&args.overrides)?;
+    let mut cfg = CollectorConfig::load(&args.overrides)?;
     let pool = build_pool(cfg.selfplay.threads)?;
+    // 会话数 0 = 自动：与并发对局数一致，避免推理被少数会话串行化
+    if cfg.scheduler.sessions == 0 {
+        cfg.scheduler.sessions = pool.current_num_threads();
+    }
 
     println!("=== banqi-collector 启动（scheduler）v{CLIENT_VERSION} ===");
     println!("生效配置：\n{}", cfg.to_toml()?);
     println!(
-        "自对弈线程池 = {} 线程（variant 由服务端 GetTask 下发）",
-        pool.current_num_threads()
+        "自对弈线程池 = {} 线程，ONNX 会话数 = {} （variant 由服务端 GetTask 下发）",
+        pool.current_num_threads(),
+        cfg.scheduler.sessions
     );
     if let Some(path) = &args.overrides.config_dump {
         cfg.dump_to(path)?;
@@ -100,15 +105,14 @@ fn run_scheduler(
         let started = Instant::now();
         match task.kind {
             TaskKind::TaskSelfplay => {
+                // 同一模型（会话池）供 A/B 共用：会话池内各通道等价，A/B 谁都能用满，
+                // 比「每方固定一条会话」更省通道（见 scheduler_registry::model）。
                 let model = registry.model(&task.network_sha)?;
-                // A/B 各持独立 ONNX 会话：OnnxModel 内部以 Mutex<Session> 串行化推理，
-                // 双方共用单会话会把双色对局压成单通道（实测吞吐约减半）。
-                let opponent = registry.opponent_model(&task.network_sha)?;
                 let result = run_variant_dispatch(
                     &task.variant,
                     task.initial_revealed,
+                    Arc::clone(&model),
                     model,
-                    opponent,
                     &selfplay,
                     task.games,
                     true,

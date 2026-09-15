@@ -63,9 +63,9 @@ struct Args {
     /// 选手类型：onnx（双方同网，默认）/ random（绕开 ONNX，用于隔离环境与搜索层）
     #[arg(long, default_value = "onnx")]
     players: String,
-    /// ONNX 会话数：shared（双方共用 1 个会话，bin/collector.rs 现状）/ split（每方 1 个，老侧 run_native_match 现状）
-    #[arg(long, default_value = "shared")]
-    sessions: String,
+    /// ONNX 会话数（并发推理通道数；0 = 自动 = 线程数）
+    #[arg(long, default_value_t = 0)]
+    sessions: usize,
     /// 固定种子（缺省不固定）
     #[arg(long)]
     seed: Option<u64>,
@@ -87,8 +87,7 @@ fn build_config(args: &Args) -> SelfPlayConfig {
 }
 
 fn run_games<G>(
-    model_a: &Option<Arc<OnnxModel>>,
-    model_b: &Option<Arc<OnnxModel>>,
+    model: &Option<Arc<OnnxModel>>,
     players: &str,
     config: &SelfPlayConfig,
     n_games: usize,
@@ -101,11 +100,10 @@ where
     let (spec_a, spec_b) = if players == "random" {
         (PlayerSpec::Random, PlayerSpec::Random)
     } else {
-        let ma = model_a.as_ref().expect("onnx 选手需要已加载的模型");
-        let mb = model_b.as_ref().expect("onnx 选手需要已加载的模型");
+        let m = model.as_ref().expect("onnx 选手需要已加载的模型");
         (
-            PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(Arc::clone(ma)))),
-            PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(Arc::clone(mb)))),
+            PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(Arc::clone(m)))),
+            PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(Arc::clone(m)))),
         )
     };
     run_match_core(MatchParams {
@@ -133,17 +131,16 @@ fn episodes_gz(episodes: &[GameEpisode]) -> Result<Vec<u8>> {
 
 fn dispatch(
     args: &Args,
-    model_a: &Option<Arc<OnnxModel>>,
-    model_b: &Option<Arc<OnnxModel>>,
+    model: &Option<Arc<OnnxModel>>,
     config: &SelfPlayConfig,
     n_games: usize,
     seed: Option<u64>,
     pool: &rayon::ThreadPool,
 ) -> Result<banqi_collector::pipeline::self_play::MatchResult> {
     let r = match args.variant.as_str() {
-        "4x8" => run_games::<DarkChessEnv>(model_a, model_b, &args.players, config, n_games, seed, pool),
-        "4x4" => run_games::<Game4x4Env>(model_a, model_b, &args.players, config, n_games, seed, pool),
-        "4x2" => run_games::<MiniDarkChessEnv>(model_a, model_b, &args.players, config, n_games, seed, pool),
+        "4x8" => run_games::<DarkChessEnv>(model, &args.players, config, n_games, seed, pool),
+        "4x4" => run_games::<Game4x4Env>(model, &args.players, config, n_games, seed, pool),
+        "4x2" => run_games::<MiniDarkChessEnv>(model, &args.players, config, n_games, seed, pool),
         other => return Err(anyhow!("未知变体: {other}（可选 4x8 / 4x4 / 4x2）")),
     };
     if r.episodes.is_empty() {
@@ -155,33 +152,30 @@ fn dispatch(
 fn main() -> Result<()> {
     let args = Args::parse();
     let config = build_config(&args);
+    let threads = if args.threads > 0 {
+        args.threads
+    } else {
+        num_cpus::get()
+    };
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(if args.threads > 0 {
-            args.threads
-        } else {
-            num_cpus::get()
-        })
+        .num_threads(threads)
         .build()
         .context("构建 rayon 线程池失败")?;
+    let sessions = if args.sessions > 0 { args.sessions } else { threads };
 
     let t_load = Instant::now();
-    let (model_a, model_b) = if args.players == "random" {
-        (None, None)
+    let model = if args.players == "random" {
+        None
     } else {
-        let load = || -> Result<Arc<OnnxModel>> {
-            Ok(Arc::new(
-                OnnxModel::new(&args.model, &args.device)
-                    .map_err(|e| anyhow!("ONNX 模型加载失败 ({}): {e}", args.model))?,
-            ))
-        };
-        let a = load()?;
-        let b = if args.sessions == "split" { load()? } else { Arc::clone(&a) };
-        (Some(a), Some(b))
+        Some(Arc::new(
+            OnnxModel::with_sessions(&args.model, &args.device, sessions)
+                .map_err(|e| anyhow!("ONNX 模型加载失败 ({}): {e}", args.model))?,
+        ))
     };
     let load_s = t_load.elapsed().as_secs_f64();
 
     println!(
-        "CONFIG variant={} sims={} mca={} games={} threads={} batches={} warmup={} device={} players={} sessions={} record=true",
+        "CONFIG variant={} sims={} mca={} games={} threads={} batches={} warmup={} device={} players={} sessions={sessions} record=true",
         args.variant,
         config.mcts_sims,
         config.max_considered_actions,
@@ -191,18 +185,17 @@ fn main() -> Result<()> {
         args.warmup,
         args.device,
         args.players,
-        args.sessions
     );
     println!("METRIC stage=model_load elapsed_s={load_s:.4}");
 
     for i in 0..args.warmup {
-        let _ = dispatch(&args, &model_a, &model_b, &config, args.games, args.seed, &pool)?;
+        let _ = dispatch(&args, &model, &config, args.games, args.seed, &pool)?;
         println!("METRIC stage=warmup batch={i}");
     }
 
     for i in 0..args.batches {
         let t0 = Instant::now();
-        let r = dispatch(&args, &model_a, &model_b, &config, args.games, args.seed, &pool)?;
+        let r = dispatch(&args, &model, &config, args.games, args.seed, &pool)?;
         let gen_s = t0.elapsed().as_secs_f64();
 
         let n_games = r.episodes.len();

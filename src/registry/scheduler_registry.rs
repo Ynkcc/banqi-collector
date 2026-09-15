@@ -60,6 +60,9 @@ pub struct SchedulerConfig {
     pub worker_id: String,
     pub cache_dir: PathBuf,
     pub device: String,
+    /// ONNX 会话数（每 sha 的并发推理通道数；0 = 自动 = 自对弈线程数）。
+    /// `OnnxModel` 内部每个会话用互斥锁串行化推理，通道数少于并发对局数时推理成为瓶颈。
+    pub sessions: usize,
     /// 允许同时在途的上报批数（背压上限；同时约束驻留内存）
     pub max_inflight_reports: usize,
 }
@@ -71,6 +74,7 @@ impl Default for SchedulerConfig {
             worker_id: String::new(),
             cache_dir: PathBuf::from("outputs/distributed_cache"),
             device: "auto".to_string(),
+            sessions: 0,
             max_inflight_reports: 2,
         }
     }
@@ -117,10 +121,8 @@ pub struct SchedulerRegistry {
     channel: Channel,
     http: reqwest::Client,
     cfg: SchedulerConfig,
-    /// 本地已加载的模型缓存（sha -> 主会话）
+    /// 本地已加载的模型缓存（sha -> 会话池）
     models: HashMap<String, Arc<OnnxModel>>,
-    /// 自对弈对手侧的独立会话缓存（sha -> 第二会话），见 `opponent_model`。
-    opponent_models: HashMap<String, Arc<OnnxModel>>,
     /// 当前持有的网络 sha（GetTask 时上报，服务端据此免发下载 URL）
     current_network: String,
     /// 心跳共享状态：累计完成局数
@@ -180,7 +182,6 @@ impl SchedulerRegistry {
             http,
             cfg,
             models: HashMap::new(),
-            opponent_models: HashMap::new(),
             current_network: String::new(),
             completed_games,
             running_task_id,
@@ -365,7 +366,7 @@ impl SchedulerRegistry {
         Ok(())
     }
 
-    /// 返回指定 sha 的推理模型；首次使用时从缓存文件加载 onnx。
+    /// 返回指定 sha 的推理模型（含 `sessions` 条并发推理通道）；首次使用时加载。
     pub fn model(&mut self, sha: &str) -> Result<Arc<OnnxModel>> {
         if let Some(m) = self.models.get(sha) {
             return Ok(Arc::clone(m));
@@ -375,28 +376,18 @@ impl SchedulerRegistry {
         Ok(model)
     }
 
-    /// 返回指定 sha 的第二个独立推理会话，供自对弈 A/B 分别持有。
-    ///
-    /// `OnnxModel` 内部以 `Mutex<Session>` 串行化推理（见 banqi-engine），双方共用
-    /// 单个会话时双色对局的推理会挤在同一条通道上排队，批量自对弈吞吐约减半；
-    /// 老侧 `run_native_match` 为每方各建一个会话，此处与之对齐。
-    pub fn opponent_model(&mut self, sha: &str) -> Result<Arc<OnnxModel>> {
-        if let Some(m) = self.opponent_models.get(sha) {
-            return Ok(Arc::clone(m));
-        }
-        let model = self.load_model(sha)?;
-        self.opponent_models.insert(sha.to_string(), Arc::clone(&model));
-        Ok(model)
-    }
-
-    /// 从本地缓存文件加载一个新的 ONNX 会话（不做缓存，由调用方决定归属）。
+    /// 从本地缓存文件加载会话池（每 sha 一份，由 `model` 缓存）。
     fn load_model(&self, sha: &str) -> Result<Arc<OnnxModel>> {
         let path = network_path(&self.cfg.cache_dir, sha);
-        Ok(Arc::new(OnnxModel::new(
-            &path.display().to_string(),
-            &self.cfg.device,
-        )
-        .map_err(|e| anyhow::anyhow!("加载 onnx 失败 ({sha}): {e}"))?))
+        let sessions = self.cfg.sessions.max(1);
+        let model = OnnxModel::with_sessions(&path.display().to_string(), &self.cfg.device, sessions)
+            .map_err(|e| anyhow::anyhow!("加载 onnx 失败 ({sha}): {e}"))?;
+        println!(
+            "[scheduler] 模型 {sha} 就绪：{} 条并发推理通道（device={}）",
+            model.session_count(),
+            self.cfg.device
+        );
+        Ok(Arc::new(model))
     }
 
     /// 查询当前 best 网络（供复用/调试）。

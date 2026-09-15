@@ -45,6 +45,9 @@ pub struct CliOverrides {
     /// 推理设备：cpu / auto
     #[arg(long)]
     pub device: Option<String>,
+    /// ONNX 会话数（并发推理通道数；0 = 自动 = 自对弈线程数）
+    #[arg(long)]
+    pub sessions: Option<usize>,
     /// 每次决策的 MCTS 模拟次数
     #[arg(long)]
     pub mcts_sims: Option<usize>,
@@ -80,6 +83,9 @@ impl CollectorConfig {
         }
         if let Some(v) = &cli.device {
             cfg.scheduler.device = v.clone();
+        }
+        if let Some(v) = &cli.sessions {
+            cfg.scheduler.sessions = *v;
         }
         if let Some(v) = &cli.mcts_sims {
             cfg.selfplay.mcts_sims = *v;
