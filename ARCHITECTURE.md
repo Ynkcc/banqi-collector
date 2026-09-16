@@ -14,7 +14,8 @@
 - `src/registry/scheduler_registry.rs`：`SchedulerRegistry` — gRPC 客户端（`Channel` 长连接，一次建连全程复用）+ reqwest 预签名下载/直传 + sha256 SRI 校验 + 30s 后台心跳；模型按 sha 进程内缓存（每个 sha 一个**会话池**，通道数由 `scheduler.sessions` 决定，A/B、rating 双方共用）。本地权重路径由服务端下发的对象键决定（`cache_dir/<network_key>`），加载器按对象键扩展名分派（`.onnx` → ONNX，其它格式在本构建下直接报错）。上报异步化：`submit_episode_report` / `submit_match_report` 立即返回，`EpisodeBatch` 二进制编码 + gzip + sha256 + R2 直传都在后台 tokio 任务中完成，`report_slots` 信号量限制在途批数（背压 + 约束驻留内存）；心跳发现 best 变化时后台预取该网络。解析 `SelfPlayParams.extra_config`（JSON 透传）中的 `initial_revealed_pieces`，注入 `SchedulerTask.initial_revealed`。
 - `src/pb.rs`：`scheduler.proto` 生成代码（gRPC 客户端 + 训练数据记录消息），唯一来源见 `proto/`。
 - `src/pipeline/self_play/match_core.rs`：`MatchParams.make_env` 为 `Arc<dyn Fn() -> G + Send + Sync>` 环境工厂（支持课程参数闭包注入）；`run_match_core` 其余语义不变。
-- `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `codec` / `batched`），已移除 PyO3（PyPredictor）分支。`codec` 是训练数据记录的唯一编码实现（`EpisodeBatch` 二进制，proto 契约），训练侧解码在 `banqi_training/episode_codec.py`。`batched` 为可选的批量锁步路径（变体白名单 `SelfPlayConfig.batched_variants` 控制，见下）。
+- `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `codec` / `batched`），已移除 PyO3（PyPredictor）分支。`codec` 是训练数据记录的唯一编码实现（`EpisodeBatch` 二进制，proto 契约；按数据类别只编码对应的一类记录），训练侧解码在 `banqi_training/episode_codec.py`。`batched` 为可选的批量锁步路径（变体白名单 `SelfPlayConfig.batched_variants` 控制，见下）。
+- 数据类别：`SchedulerTask.data_kind`（服务端下发）决定本任务产哪类记录；`DATA_RESNET` 走 Gumbel MCTS 记录路径（当前唯一支持的类别），`DATA_NNUE` 需 Expectimax 采集路径（未接入，收到即明确报错退出）。`PlayerSpec::Expectimax` 与 `NnueEpisode` 类型已就位但 bin 尚未构造该选手。
 - `proto/scheduler.proto`：与 banqi-scheduler 仓库副本同步维护（双侧同步，变更须同时更新）。
 
 ## 变更记录
@@ -25,6 +26,11 @@
   - **编码期强校验**（宁可丢一批也不产出错位数据）：逐步维度必须与首步一致、棋盘特征必须精确 0/1、掩码必须 0/1、NNUE 特征步数与样本对齐、索引不越界、长度不溢出 u32；任一不符即整批报错，错误带步号与下标。
   - **上报内容**：`EpisodeBatch` 增加 `variant`（训练端据此校验数据未串变体）与 `nnue_episodes`；bin 现在会把 `MatchResult.nnue_episodes` 一并上报（此前被静默丢弃；该字段仅 Expectimax 路径产生，当前采集路径恒为空）。
   - **权重自描述**：本地缓存路径改由服务端下发的对象键决定（`TaskResponse.network_key` / `NetworkInfo.key`，形如 `networks/<sha>.onnx`），`load_model` 按扩展名分派并用显式错误拒绝本构建不支持的格式；旧布局 `<sha>.bin` 不再使用（旧缓存与旧 R2 对象作废）。
+- 2026-09-16：**数据类别贯通 + NNUE 特征从 MCTS 记录中剥离**：
+  - **按需产出**：`SchedulerTask.data_kind` 取自服务端 `SelfPlayParams.data_kind`，bin 原样填入 `EpisodeBatch.data_kind` 与 `EpisodeMeta.kind`；`codec::encode_episode_batch` 强制「类别 ⟺ 唯一非空记录列表」的不变式（类别不符或对应记录为空即整批报错），空 repeated 在 proto3 不占字节，因此每次上报天然只带一类数据。
+  - **能力校验**：新增 `registry::SUPPORTED_DATA_KIND`（当前仅 `DataResnet`），`get_task` 在下载权重**之前**校验，收到不支持类别即明确报错并列出改动方法——不静默照旧产 ResNet（那会把数据喂进另一条训练链路）。
+  - **彻底分家**：`GameEpisode.nnue` 字段、`SelfPlayConfig.collect_nnue_features`、`nnue_meta_and_features` 与逐步的双视角特征收集全部删除（MCTS 自对弈不再顺带收集 NNUE 稀疏特征）；`finalize_episode` 少一个参数。NNUE 特征此后只由 Expectimax 路径的 `NnueEpisode` 承载（proto 侧 `EpisodeRecord.nnue` 已 `reserved`）。
+  - **配置文件**：`collect_nnue_features` 从 `collector.example.toml` 移除（`SelfPlayConfig` 为 `deny_unknown_fields`，留着会启动即报错）。
 - 2026-09-15：会话池取代 A/B 双会话（同日早些时候的 `opponent_model` 方案作废，该方法已删除；4x2 实测 35.6 → 160 局/s，老侧 `run_native_match` 为 37.0 局/s）：
   - **`banqi-engine::OnnxModel` 会话池**（详见 banqi-engine 变更记录）：`Vec<Mutex<Session>>` + `AtomicUsize` 轮转分配，新增 `with_sessions(path, device, n)` / `session_count()`，`new()` 仍为单会话；每会话 ORT intra-op 线程取 `核数 / 会话数`。
   - **配置**：新增 `scheduler.sessions`（并发推理通道数，`0` = 自动 = 自对弈线程数，bin 启动时解析并写回生效配置；`--sessions` 可覆盖）。每会话持有独立的 ORT 会话与线程池，故内存随会话数线性增长。

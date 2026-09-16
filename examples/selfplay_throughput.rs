@@ -18,6 +18,7 @@ use clap::Parser;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use banqi_collector::pb::DataKind;
 use banqi_collector::pipeline::self_play::{
     AsDarkChessRef, GameEpisode, MatchParams, PlayerSpec, ScenarioType, SeedableEnv,
     SelfPlayConfig, encode_episode_batch, run_match_core,
@@ -130,7 +131,7 @@ where
 /// 与 registry::batch_gz 等价的编码耗时测量（EpisodeBatch 二进制 + gzip）。
 fn episodes_gz(variant: &str, episodes: &[GameEpisode]) -> Result<Vec<u8>> {
     use std::io::Write;
-    let raw = encode_episode_batch(variant, episodes, &[])?;
+    let raw = encode_episode_batch(variant, DataKind::DataResnet, episodes, &[])?;
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
     gz.write_all(&raw).context("gzip 写入失败")?;
     gz.finish().context("gzip 收尾失败")

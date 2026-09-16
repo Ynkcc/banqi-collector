@@ -39,7 +39,17 @@ use crate::pb;
 use crate::pipeline::self_play::{GameEpisode, NnueEpisode, encode_episode_batch};
 
 use pb::scheduler_service_client::SchedulerServiceClient;
-use pb::{EpisodeMeta, HeartbeatRequest, MatchResult as PbMatchResult, NetworkRequest, TaskKind, TaskRequest};
+use pb::{
+    DataKind, EpisodeMeta, HeartbeatRequest, MatchResult as PbMatchResult, NetworkRequest,
+    TaskKind, TaskRequest,
+};
+
+/// 本构建支持采集的数据类别。
+///
+/// 仅 ResNet（Gumbel MCTS）路径：NNUE 记录需要 Expectimax 采集路径 + `.nnue` 权重加载，
+/// 尚未接入。服务端下发别的类别时明确失败，绝不"照旧产 ResNet"——那会把别类的数据
+/// 静默喂进另一条训练链路。
+const SUPPORTED_DATA_KIND: DataKind = DataKind::DataResnet;
 
 /// 心跳间隔
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -90,6 +100,8 @@ pub struct SchedulerTask {
     pub variant: String,
     /// 课程学习：服务端下发的初始预翻棋子数（extra_config 透传；None = 变体默认值）。
     pub initial_revealed: Option<usize>,
+    /// 本任务要产的数据类别（服务端下发；已在 get_task 校验为本构建支持的值）
+    pub data_kind: DataKind,
 }
 
 /// 一批自对弈 episode 的上报载荷（编码/gzip/sha256 在后台完成）。
@@ -98,6 +110,8 @@ pub struct EpisodeBatch {
     pub network_sha: String,
     /// 变体标识（服务端下发）：编码进记录供训练端校验数据未串变体
     pub variant: String,
+    /// 数据类别（服务端下发）：与唯一非空的记录列表一致（两类互斥）
+    pub data_kind: DataKind,
     /// 批内聚合胜方（1 红 / -1 黑 / 0 平；调度端仅作日志统计）
     pub winner: i32,
     pub episodes: Vec<GameEpisode>,
@@ -310,8 +324,8 @@ impl SchedulerRegistry {
         }
         self.ensure_downloaded(&resp.network_sha, &resp.network_key, &resp.network_url)?;
 
-        let (mcts_sims, variant, initial_revealed) =
-            resp.params.as_ref().map_or((0, String::new(), None), |p| {
+        let (mcts_sims, variant, initial_revealed, data_kind) =
+            resp.params.as_ref().map_or((0, String::new(), None, DataKind::DataResnet), |p| {
                 let mcts = p.mcts_sims.max(0) as usize;
                 let variant = p.variant.trim().to_lowercase();
                 let revealed = if p.extra_config.is_empty() {
@@ -319,10 +333,19 @@ impl SchedulerRegistry {
                 } else {
                     parse_extra_config(&p.extra_config)
                 };
-                (mcts, variant, revealed)
+                (mcts, variant, revealed, p.data_kind())
             });
         if variant.is_empty() {
             anyhow::bail!("服务端未下发变体（SelfPlayParams.variant 为空），请升级调度器并配置 SCHEDULER_VARIANT");
+        }
+        // 能力校验放在下载权重之前：不支持的数据类别不该先白下一遍网络
+        if data_kind != SUPPORTED_DATA_KIND {
+            anyhow::bail!(
+                "服务端下发的数据类别是 {}，但本构建只支持 {}（collector 尚未接入 Expectimax 采集路径）；\
+                 请把调度器 SCHEDULER_DATA_KIND 改回 resnet，或升级并重新构建 collector",
+                data_kind.as_str_name(),
+                SUPPORTED_DATA_KIND.as_str_name()
+            );
         }
 
         let task = SchedulerTask {
@@ -334,6 +357,7 @@ impl SchedulerRegistry {
             mcts_sims,
             variant,
             initial_revealed,
+            data_kind,
         };
 
         // rating 任务：对手网络同样需就绪（各自的对象键按格式区分）
@@ -439,14 +463,15 @@ async fn report_episode_async(
     worker_id: &str,
     batch: EpisodeBatch,
 ) -> Result<(usize, usize, String)> {
-    let EpisodeBatch { task_id, network_sha, variant, winner, episodes, nnue_episodes } = batch;
+    let EpisodeBatch { task_id, network_sha, variant, data_kind, winner, episodes, nnue_episodes } =
+        batch;
     let game_count = episodes.len() + nnue_episodes.len();
     let total_steps: usize = episodes.iter().map(|e| e.game_length).sum::<usize>()
         + nnue_episodes.iter().map(|e| e.game_length).sum::<usize>();
 
     // 二进制编码 + gzip 是 CPU 密集段，放到 blocking 线程池，避免占住 tokio worker。
     let gz_body = tokio::task::spawn_blocking(move || {
-        batch_gz(&variant, &episodes, &nnue_episodes)
+        batch_gz(&variant, data_kind, &episodes, &nnue_episodes)
     })
     .await
     .context("episode 编码任务异常退出")??;
@@ -464,6 +489,7 @@ async fn report_episode_async(
             .as_secs() as i64,
         content_length: gz_body.len() as i64,
         content_sha256: hex_sha256(&gz_body),
+        kind: data_kind as i32,
     };
 
     let ack = client
@@ -690,9 +716,14 @@ fn prefetch_network(
 ///
 /// 编码失败（形状不一致 / 非 0/1 特征等契约破裂）时整批作废并向上报错：
 /// 训练数据宁可丢一批也不能静默进入训练。
-fn batch_gz(variant: &str, episodes: &[GameEpisode], nnue_episodes: &[NnueEpisode]) -> Result<Vec<u8>> {
+fn batch_gz(
+    variant: &str,
+    data_kind: DataKind,
+    episodes: &[GameEpisode],
+    nnue_episodes: &[NnueEpisode],
+) -> Result<Vec<u8>> {
     use std::io::Write;
-    let raw = encode_episode_batch(variant, episodes, nnue_episodes)?;
+    let raw = encode_episode_batch(variant, data_kind, episodes, nnue_episodes)?;
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
     gz.write_all(&raw).context("gzip 写入失败")?;
     gz.finish().context("gzip 收尾失败")

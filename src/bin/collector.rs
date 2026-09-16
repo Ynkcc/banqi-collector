@@ -150,6 +150,7 @@ fn run_scheduler(
                     task_id: task.task_id.clone(),
                     network_sha: task.network_sha.clone(),
                     variant: task.variant.clone(),
+                    data_kind: task.data_kind,
                     winner,
                     episodes: result.episodes,
                     nnue_episodes: result.nnue_episodes,

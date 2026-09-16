@@ -320,7 +320,6 @@ where
                     std::mem::take(&mut episode_data[i]),
                     winner,
                     health_diff_red,
-                    None,
                 );
                 games.push(outcome_from_episode(ep, player_a_is_red));
             }

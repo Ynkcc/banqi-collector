@@ -18,10 +18,6 @@ pub fn finalize_episode(
     episode_data: Vec<(ResNetObservation, Vec<f32>, f32, f32, u32, Player, Vec<i32>, usize, bool)>,
     winner: Option<i32>,
     health_diff_red: Option<f32>,
-    nnue: Option<(
-        crate::pipeline::self_play::NnueEpisodeMeta,
-        Vec<crate::pipeline::self_play::NnueStepFeatures>,
-    )>,
 ) -> crate::pipeline::self_play::GameEpisode {
     let game_length = episode_data.len();
     let reward_red: f32 = match winner {
@@ -57,24 +53,11 @@ pub fn finalize_episode(
             )
         })
         .collect();
-    let mut nnue = nnue;
-    if let Some((_, feats)) = &mut nnue {
-        // 特征步数必须与样本严格对齐，防止收集/回填路径不一致导致错位
-        if feats.len() != game_length {
-            eprintln!(
-                "⚠️ finalize_episode: NNUE 特征步数({})与样本步数({})不一致，丢弃本局 NNUE 特征",
-                feats.len(),
-                game_length
-            );
-            nnue = None;
-        }
-    }
     crate::pipeline::self_play::GameEpisode {
         samples,
         game_length,
         winner,
         health_diff_red,
-        nnue,
     }
 }
 

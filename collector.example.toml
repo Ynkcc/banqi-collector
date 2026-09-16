@@ -1,0 +1,41 @@
+# banqi-collector 配置示例。
+# 分层加载：默认值 → 本文件（--config）→ CLI 覆盖；启动时打印生效配置，
+# --config-dump <PATH> 可落盘快照并回灌。
+
+[scheduler]
+# 调度器 gRPC 地址
+endpoint = "http://127.0.0.1:50051"
+# worker 标识；留空则自动取 worker-<pid>
+worker_id = ""
+# 网络/模型本地缓存目录（相对路径按进程工作目录解析）
+cache_dir = "outputs/distributed_cache"
+# 推理设备：auto / cpu
+device = "auto"
+# ONNX 会话数（并发推理通道数）；0 = 自动 = 自对弈线程数
+sessions = 0
+# 在途上报批数上限（背压，同时约束驻留内存）
+max_inflight_reports = 2
+
+[selfplay]
+# 自对弈线程数；0 = CPU 核数
+threads = 0
+# 每次决策的 MCTS 模拟次数（调度器下发的值会覆盖此处的值）
+mcts_sims = 64
+# Gumbel Top-K 候选动作数
+max_considered_actions = 16
+# 训练场景
+scenario = "standard"
+# PUCT 探索系数与训练目标 σ 的缩放因子
+c_scale = 1.0
+# Gumbel 噪声尺度
+gumbel_scale = 1.0
+# 算力分配随机化（Fast/Full Search 混合）
+playout_cap_random_enabled = false
+# Fast Search 模拟次数；0 = 由 mcts_sims 推导（mcts_sims / 4）
+fast_mcts_sims = 0
+# Full Search 出现概率
+full_search_prob = 0.25
+# 血量差异头参与 MCTS 搜索（复合效用 U = Q_win + λ·Q_hp）
+health_enabled = false
+health_weight = 0.0
+health_confidence_exp = 0.0

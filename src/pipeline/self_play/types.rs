@@ -94,10 +94,6 @@ pub struct GameEpisode {
     pub winner: Option<i32>,
     /// 终局归一化血量差（红方视角为正）：(红HP-黑HP)/(初始总HP+最大子力分值)，大致落在 [-1,1]。
     pub health_diff_red: Option<f32>,
-    /// NNUE 稀疏特征：None = 未收集；Some 时元组为 (布局元信息, 每步特征)，
-    /// 每步特征长度与 samples 严格对齐。
-    #[serde(default)]
-    pub nnue: Option<(NnueEpisodeMeta, Vec<NnueStepFeatures>)>,
 }
 
 // ================ 场景定义 ================
@@ -178,8 +174,6 @@ pub struct SelfPlayConfig {
     pub health_weight: f32,
     /// λ 随 |v_win| 的自适应幂指数（0 = 常量 λ）
     pub health_confidence_exp: f32,
-    /// 是否在记录 Episode 时同步收集 NNUE 稀疏特征（供 NNUE 训练管道）
-    pub collect_nnue_features: bool,
     /// 走批量锁步路径的变体白名单（空 = 全部走单树路径，即历史行为）。
     ///
     /// 批量路径把多局树的叶子评估合并成一个大 batch 送推理（见 `self_play::batched`），
@@ -218,7 +212,6 @@ impl Default for SelfPlayConfig {
             health_enabled: false,
             health_weight: 0.0,
             health_confidence_exp: 0.0,
-            collect_nnue_features: false,
             batched_variants: Vec::new(),
             tree_reuse: false,
             threads: 0,
@@ -337,7 +330,6 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                         episode_data,
                         winner,
                         env.terminal_health_diff_red(),
-                        None,
                     );
                 }
                 Err(e) => {
@@ -347,7 +339,6 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                         episode_data,
                         None,
                         env.terminal_health_diff_red(),
-                        None,
                     );
                 }
             };
@@ -385,7 +376,6 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                             episode_data,
                             winner,
                             env.terminal_health_diff_red(),
-                            None,
                         );
                     }
                 }
@@ -396,7 +386,6 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                         game_length: step,
                         winner: None,
                         health_diff_red: env.terminal_health_diff_red(),
-                        nnue: None,
                     };
                 }
             }
@@ -410,7 +399,6 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                     episode_data,
                     Some(0),
                     env.terminal_health_diff_red(),
-                    None,
                 );
             }
         }

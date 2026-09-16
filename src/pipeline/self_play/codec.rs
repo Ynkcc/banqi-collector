@@ -18,7 +18,7 @@ use prost::Message;
 
 use banqi_core::core::env::ResNetObservation;
 
-use crate::pb::{EpisodeBatch, EpisodeRecord, NnueEpisodeRecord, NnueFeatures, NnueMeta};
+use crate::pb::{DataKind, EpisodeBatch, EpisodeRecord, NnueEpisodeRecord, NnueFeatures, NnueMeta};
 use crate::pipeline::self_play::{GameEpisode, NnueEpisode, NnueEpisodeMeta, NnueStepFeatures};
 
 /// 记录格式版本。字段语义或布局破坏性变更时递增；训练端遇到不认识的版本直接拒绝。
@@ -26,19 +26,35 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// 编码一批自对弈记录为 `EpisodeBatch` 二进制载荷（调用方负责再 gzip）。
 ///
-/// `variant` 为变体标识（4x8 / 4x4 / 4x2），训练端据此校验数据未串变体。
+/// - `variant`：变体标识（4x8 / 4x4 / 4x2），训练端据此校验数据未串变体；
+/// - `kind`：本批数据类别，必须与唯一非空的那个入参一致（两类互斥，见 proto 注释）。
+///
 /// 无有效样本的局直接跳过（不计入记录），因为它不携带任何训练信号。
 pub fn encode_episode_batch(
     variant: &str,
+    kind: DataKind,
     episodes: &[GameEpisode],
     nnue_episodes: &[NnueEpisode],
 ) -> Result<Vec<u8>> {
     if variant.is_empty() {
         bail!("变体标识为空，无法标注训练数据来源");
     }
+    match (kind, episodes.is_empty(), nnue_episodes.is_empty()) {
+        (DataKind::DataResnet, false, true) | (DataKind::DataNnue, true, false) => {}
+        (DataKind::DataResnet, true, _) => {
+            bail!("数据类别为 ResNet，但本批没有可编码的 GameEpisode（0 局产出）")
+        }
+        (DataKind::DataNnue, _, true) => {
+            bail!("数据类别为 NNUE，但本批没有可编码的 NnueEpisode（0 局产出）")
+        }
+        (DataKind::DataResnet, _, false) => bail!("数据类别为 ResNet，却携带了 NNUE 记录（两类互斥）"),
+        (DataKind::DataNnue, false, _) => bail!("数据类别为 NNUE，却携带了 ResNet 记录（两类互斥）"),
+    }
+
     let mut batch = EpisodeBatch {
         schema_version: SCHEMA_VERSION,
         variant: variant.to_string(),
+        kind: kind as i32,
         episodes: Vec::with_capacity(episodes.len()),
         nnue_episodes: Vec::with_capacity(nnue_episodes.len()),
     };
@@ -154,16 +170,6 @@ fn encode_episode(ep: &GameEpisode) -> Result<Option<EpisodeRecord>> {
         is_full_search.push(u8::from(*is_full));
     }
 
-    let nnue = match &ep.nnue {
-        Some((meta, feats)) => {
-            if feats.len() != steps {
-                bail!("NNUE 特征步数 {} 与样本步数 {steps} 不一致", feats.len());
-            }
-            Some(encode_nnue_features(meta, feats)?)
-        }
-        None => None,
-    };
-
     Ok(Some(EpisodeRecord {
         steps: u32_of(steps, "样本步数")?,
         board_channels: u32_of(board_channels, "棋盘通道数")?,
@@ -185,7 +191,6 @@ fn encode_episode(ep: &GameEpisode) -> Result<Option<EpisodeRecord>> {
         game_length: u32_of(ep.game_length, "对局步数")?,
         winner: ep.winner,
         health_diff_red: ep.health_diff_red,
-        nnue,
     }))
 }
 
@@ -221,10 +226,8 @@ fn encode_nnue_episode(ep: &NnueEpisode) -> Result<Option<NnueEpisodeRecord>> {
     }
 
     Ok(Some(NnueEpisodeRecord {
-        meta: Some(meta_of(&ep.meta)),
         steps: u32_of(steps, "样本步数")?,
-        features_indices: features.indices,
-        features_offsets: features.offsets,
+        features: Some(features),
         search_values,
         players,
         actions,
@@ -397,18 +400,20 @@ mod tests {
             game_length: 2,
             winner: Some(1),
             health_diff_red: Some(0.3),
-            nnue: None,
         }
     }
 
     #[test]
     fn encode_episode_layout() {
         let ep = sample_episode();
-        let raw = encode_episode_batch("4x4", std::slice::from_ref(&ep), &[]).unwrap();
+        let raw = encode_episode_batch("4x4", DataKind::DataResnet, std::slice::from_ref(&ep), &[])
+            .unwrap();
         let batch = EpisodeBatch::decode(raw.as_slice()).unwrap();
 
         assert_eq!(batch.schema_version, SCHEMA_VERSION);
         assert_eq!(batch.variant, "4x4");
+        assert_eq!(batch.kind, DataKind::DataResnet as i32);
+        assert!(batch.nnue_episodes.is_empty());
         assert_eq!(batch.episodes.len(), 1);
         let rec = &batch.episodes[0];
 
@@ -435,21 +440,51 @@ mod tests {
     fn reject_non_binary_board() {
         let mut ep = sample_episode();
         ep.samples[0].0.board[[0, 0, 0]] = 0.5;
-        let err = encode_episode_batch("4x4", &[ep], &[]).unwrap_err();
+        let err = encode_episode_batch("4x4", DataKind::DataResnet, &[ep], &[]).unwrap_err();
         assert!(format!("{err:#}").contains("不是 0/1"), "实际错误: {err:#}");
     }
 
+    /// 类别必须与实际产出的记录一致：ResNet 任务给 NNUE 记录、或 0 局产出，都要失败。
     #[test]
-    fn skip_empty_episodes() {
-        let ep = GameEpisode {
-            samples: Vec::new(),
-            game_length: 12,
-            winner: None,
-            health_diff_red: None,
-            nnue: None,
+    fn reject_kind_mismatch() {
+        let nnue = NnueEpisode {
+            meta: NnueEpisodeMeta {
+                feature_dim: 64,
+                states_per_square: 8,
+                bag_stride: 4,
+                num_active: 4,
+                total_positions: 8,
+            },
+            features: vec![NnueStepFeatures { mover: vec![1], opponent: vec![2] }],
+            search_values: vec![0.1],
+            players: vec![1],
+            actions: vec![0],
+            game_length: 1,
+            winner: Some(1),
         };
-        let raw = encode_episode_batch("4x4", &[ep], &[]).unwrap();
+        let resnet = sample_episode();
+
+        // 类别与实际记录不符
+        let err = encode_episode_batch(
+            "4x4",
+            DataKind::DataResnet,
+            std::slice::from_ref(&resnet),
+            std::slice::from_ref(&nnue),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("互斥"), "实际错误: {err:#}");
+
+        // 类别正确、但对应记录为空（J 局产出为 0）
+        let err = encode_episode_batch("4x4", DataKind::DataResnet, &[], &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("0 局产出"), "实际错误: {err:#}");
+
+        // NNUE 类别走通，且 kind 落在报文里
+        let raw = encode_episode_batch("4x4", DataKind::DataNnue, &[], &[nnue]).unwrap();
         let batch = EpisodeBatch::decode(raw.as_slice()).unwrap();
+        assert_eq!(batch.kind, DataKind::DataNnue as i32);
         assert!(batch.episodes.is_empty());
+        assert_eq!(batch.nnue_episodes.len(), 1);
+        assert_eq!(batch.nnue_episodes[0].steps, 1);
+        assert_eq!(batch.nnue_episodes[0].features.as_ref().unwrap().indices.len(), 2 * 4);
     }
 }

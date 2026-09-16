@@ -37,12 +37,20 @@ enum TaskKind {
   TASK_RATING = 2;    // gatekeeper / rating 对打
 }
 
+// 训练数据类别：决定 worker 产哪类记录、trainer 消费哪类对象。
+// 两类互斥（同一批对象只含一种），由服务端下发（SCHEDULER_DATA_KIND / WebUI 在线切换）。
+enum DataKind {
+  DATA_RESNET = 0;    // Gumbel MCTS 自对弈 → EpisodeRecord（ResNet 稠密特征，配 .onnx 权重）
+  DATA_NNUE = 1;      // Expectimax 强自对弈 → NnueEpisodeRecord（NNUE 稀疏特征，配 .nnue 权重）
+}
+
 message SelfPlayParams {
   int32 mcts_sims = 1;
   float temperature = 2;
   bool playout_cap_random = 3;
   string variant = 4;           // 4x8 / 4x4 / 4x2
   string extra_config = 5;      // JSON 透传
+  DataKind data_kind = 6;       // 本任务要产的数据类别（rating 任务不产数据，该字段无意义）
 }
 
 // episode 元数据上报：服务端只收元数据 + 签发 R2 预签名 PUT，数据直传 R2
@@ -56,6 +64,7 @@ message EpisodeMeta {
   int64 timestamp = 7;
   int64 content_length = 8;     // 待上传对象大小
   string content_sha256 = 9;    // 对象 sha256（R2 强校验）
+  DataKind kind = 10;           // 本批对象的数据类别（落库，供 ListEpisodes 按类别过滤）
 }
 
 message EpisodeAck {
@@ -161,7 +170,10 @@ message SignNetworkUploadAck {
 // trainer 拉取已登记 episode 的预签名 GET 列表（游标分页）
 message ListEpisodesRequest {
   int32 limit = 1;              // 单次最多返回条数（0 = 服务端默认）
-  string after_key = 2;         // 游标：仅返回 object_key 字典序大于它的对象
+  string after_key = 2;         // 游标：上次返回的最后一个对象键（服务端按登记顺序推进）
+  // 数据类别过滤：缺省 = 不过滤。consumer 应显式指定自己消费的类别，
+  // 避免下载并解析无法消费的对象。
+  optional DataKind kind = 3;
 }
 
 message EpisodeObject {
@@ -195,12 +207,17 @@ message GetInfoReply {
 // - 所有 bytes 字段是「稠密小端缓冲区」，训练端用 np.frombuffer 零拷贝还原，
 //   不做逐元素文本解析。
 // - 位打包（boards_bits / action_masks_bits）：字节内高位对应较小下标
-//   （与 numpy.unpackbits(bitorder='big') 一致），行主序，尾部补 0。
+//   （与 numpy.unpackbits(bitorder='big') 一致），尾部补 0；棋盘布局为
+//   [步][通道][位置字节]（每通道独立字节对齐），掩码布局为 [步][动作字节]。
+// - 数据类别（kind）互斥：一批对象只承载一种记录，产出方只上报实际产出的那一类。
 // ============================================================================
 
 message EpisodeBatch {
   uint32 schema_version = 1;
   string variant = 2;                    // 4x8 / 4x4 / 4x2（训练端据此校验变体一致）
+  DataKind kind = 5;                     // 本批数据类别：与下述两个 repeated 唯一非空项一致
+  // 两类记录互斥：kind=DATA_RESNET 时只有 episodes，kind=DATA_NNUE 时只有 nnue_episodes。
+  // 空 repeated 在 proto3 不占字节，worker 只上报实际产出的那一类（按需）。
   repeated EpisodeRecord episodes = 3;   // Gumbel MCTS 自对弈记录
   repeated NnueEpisodeRecord nnue_episodes = 4;  // Expectimax 强自对弈记录
 }
@@ -231,8 +248,8 @@ message EpisodeRecord {
   uint32 game_length = 18;     // 实际对局步数（出错路径下 samples 为空，可能 > steps）
   optional int32 winner = 19;  // 1 红 / -1 黑 / 0 平；缺省 = 本局作废
   optional float health_diff_red = 20;  // 红方视角的终局血量差
-  // 可选：自对弈开启 collect_nnue_features 时存在（供 NNUE 蒸馏）。
-  NnueFeatures nnue = 21;
+  reserved 21;                 // 曾用于「MCTS 记录内嵌 NNUE 稀疏特征」，已废弃：
+                               // NNUE 特征只由 NnueEpisodeRecord 承载，两类数据彻底分家
 }
 
 // NNUE 特征布局元信息（由 env.config 推导，训练端免硬编码还原维度）。
@@ -256,15 +273,13 @@ message NnueFeatures {
 
 // Expectimax 强自对弈的 NNUE 专属记录（无 ResNet 大张量）。
 message NnueEpisodeRecord {
-  NnueMeta meta = 1;
-  uint32 steps = 2;
-  bytes features_indices = 3;  // 同 NnueFeatures.indices
-  bytes features_offsets = 4;  // 同 NnueFeatures.offsets
-  bytes search_values = 5;     // steps × f32（搜索根值，行棋方视角）
-  bytes players = 6;           // steps × i32（1 红 / -1 黑）
-  bytes actions = 7;           // steps × u32
-  uint32 game_length = 8;
-  optional int32 winner = 9;
+  uint32 steps = 1;
+  NnueFeatures features = 2;   // 双视角稀疏特征（布局元信息 + 索引 + 前缀和偏移）
+  bytes search_values = 3;     // steps × f32（搜索根值，行棋方视角）
+  bytes players = 4;           // steps × i32（1 红 / -1 黑）
+  bytes actions = 5;           // steps × u32
+  uint32 game_length = 6;
+  optional int32 winner = 7;
 }
 
 service SchedulerService {
