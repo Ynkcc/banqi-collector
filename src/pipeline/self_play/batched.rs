@@ -33,7 +33,8 @@ use banqi_core::core::env::SnapshotEnv;
 use banqi_core::core::env::seed::SeedableEnv;
 use banqi_core::core::env::{GameEnv, Player, ResNetObservation};
 use banqi_core::core::mcts::{
-    BatchedTree, Evaluator, GumbelConfig, PendingEval, health_logits_expectation,
+    BatchedTree, Evaluator, EvaluatorError, GumbelConfig, PendingEval,
+    health_expectation_required,
 };
 
 use super::SelfPlayConfig;
@@ -154,7 +155,7 @@ pub(crate) fn run_batched_games<G, E>(
     concurrency: usize,
     seed: Option<u64>,
     make_env: &Arc<dyn Fn() -> G + Send + Sync>,
-) -> Vec<GameOutcome>
+) -> Result<Vec<GameOutcome>, EvaluatorError>
 where
     G: GameEnv + SeedableEnv + AsDarkChessRef,
     E: Evaluator<G> + Sync,
@@ -169,6 +170,17 @@ where
         health_weight: config.health_weight,
         health_confidence_exp: config.health_confidence_exp,
     };
+
+    // 血量契约校验（Part C #5）：血量项参与搜索时，评估器必须真的提供血量分桶输出。
+    // 批量路径不经过 GumbelMCTS::run 的根校验（根评估由外层 apply 回填），
+    // 若不在此处拦下，血量项会静默恒 0，让 H2 类实验在「看起来正常」下得出错误结论。
+    // 用一个真实局面做一次前向探测（成本：一次推理）。
+    let health_active = gumbel_cfg.health_active();
+    if health_active {
+        let probe_env = make_env();
+        let out = evaluator.evaluate(std::slice::from_ref(&probe_env))?;
+        out.health_expectation_required(0, true)?;
+    }
 
     // 共享请求队列 + 响应通道
     let queue = Arc::new(EvalQueue::<G>::default());
@@ -296,7 +308,8 @@ where
                 while let Ok(resp) = resp_rx.try_recv() {
                     apply_response(
                         &mut trees, &mut active, &mut abandoned, &mut blocked, &mut in_flight, resp,
-                    );
+                        health_active,
+                    )?;
                 }
 
                 // 5) 没有任何树可推进（要么全结束，要么全部在等待在途批）→
@@ -309,8 +322,8 @@ where
                     match resp_rx.recv() {
                         Ok(resp) => apply_response(
                             &mut trees, &mut active, &mut abandoned, &mut blocked, &mut in_flight,
-                            resp,
-                        ),
+                            resp, health_active,
+                        )?,
                         Err(_) => break,
                     }
                 } else if !has_active {
@@ -351,7 +364,7 @@ where
         *stopped.lock().unwrap() = true;
         queue.shutdown();
 
-        games
+        Ok(games)
     })
 }
 
@@ -368,12 +381,14 @@ fn apply_response<G, E>(
     blocked: &mut [Option<u64>],
     in_flight: &mut HashMap<u64, (Vec<usize>, Vec<PendingEval<G>>)>,
     resp: EvalResponse,
-) where
+    health_active: bool,
+) -> Result<(), EvaluatorError>
+where
     G: GameEnv,
     E: Evaluator<G>,
 {
     let Some((targets, evals)) = in_flight.remove(&resp.id) else {
-        return;
+        return Ok(());
     };
     let degrade = resp.failed || resp.logits.len() != evals.len();
     if degrade {
@@ -390,7 +405,7 @@ fn apply_response<G, E>(
             active[t] = false;
             blocked[t] = None;
         }
-        return;
+        return Ok(());
     }
 
     let mut by_tree: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -403,10 +418,14 @@ fn apply_response<G, E>(
         }
         let mut applied: Vec<(&PendingEval<G>, &[f32], f32, f32)> = Vec::with_capacity(idxs.len());
         for &k in &idxs {
-            let health = health_logits_expectation(resp.health.as_deref(), k).unwrap_or(0.0);
+            // 血量契约校验（Part C #5）：要求血量项参与搜索而响应里没有血量输出时硬失败，
+            // 不再 unwrap_or(0.0) 静默退化（批量路径不经过 GumbelMCTS::run 的根校验）。
+            let health =
+                health_expectation_required(resp.health.as_deref(), k, health_active)?;
             applied.push((&evals[k], &resp.logits[k], resp.values[k], health));
         }
         trees[t].apply(&applied);
         blocked[t] = None;
     }
+    Ok(())
 }

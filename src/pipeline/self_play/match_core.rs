@@ -670,6 +670,12 @@ where
             params.seed,
             &params.make_env,
         )
+        .unwrap_or_else(|e| {
+            // 血量契约等静态配置错误无法在批内恢复：整批中止（0 局产出），
+            // 由上层按「0 局产出」报错，避免把错误配置下的数据写进训练。
+            eprintln!("❌ 批量自对弈中止: {e}");
+            Vec::new()
+        })
     } else {
         match params.thread_pool {
             Some(pool) => pool.install(|| indices.into_par_iter().map(play).collect()),
