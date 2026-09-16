@@ -125,14 +125,18 @@ where
 // ============================================================================
 
 /// 用 Gumbel MCTS 驱动的模型动作选择。
-fn model_mcts_action<G>(env: &G, evaluator: &PlayerEval<G>, sims: usize) -> Option<usize>
+///
+/// `c_scale` 必须与记录（自对弈生成）路径一致地取自 `SelfPlayConfig.c_scale`：
+/// 该系数同时作用于非根 PUCT 与训练目标 σ = c_scale·ln(1+N_root)，评估侧用不同
+/// 取值会让「晋级判定用的搜索」与「产数据用的搜索」变成两套口径，A/B 结论失真。
+fn model_mcts_action<G>(env: &G, evaluator: &PlayerEval<G>, sims: usize, c_scale: f32) -> Option<usize>
 where
     G: GameEnv + AsDarkChessRef + Sync,
 {
     let config = GumbelConfig {
         num_simulations: sims,
         max_considered_actions: 16,
-        c_scale: 0.25,
+        c_scale,
         gumbel_scale: 1.0,
         ..Default::default()
     };
@@ -193,7 +197,12 @@ fn random_action<G: GameEnv>(env: &G) -> Option<usize> {
 }
 
 /// 按选手类型选择一步动作（评估路径，不记录 Episode）。
-fn get_player_action<G>(env: &G, spec: &PlayerSpec<G>, model_sims: usize) -> Option<usize>
+fn get_player_action<G>(
+    env: &G,
+    spec: &PlayerSpec<G>,
+    model_sims: usize,
+    model_c_scale: f32,
+) -> Option<usize>
 where
     G: GameEnv + AsDarkChessRef + Sync,
 {
@@ -201,7 +210,9 @@ where
         PlayerSpec::Expectimax(e) => {
             e.search_par(env.as_darkchess_ref()).map(|r| r.action)
         }
-        PlayerSpec::ModelEval(e) => model_mcts_action(env, &PlayerEval::Model(e.clone()), model_sims),
+        PlayerSpec::ModelEval(e) => {
+            model_mcts_action(env, &PlayerEval::Model(e.clone()), model_sims, model_c_scale)
+        }
         PlayerSpec::PolicyArgmax(e) => policy_argmax_action(env, e),
         PlayerSpec::Random => random_action(env),
     }
@@ -227,6 +238,7 @@ fn play_one_game<G>(
     player_b_spec: &PlayerSpec<G>,
     player_a_is_red: bool,
     model_sims: usize,
+    model_c_scale: f32,
     game_seed: Option<u64>,
     make_env: &Arc<dyn Fn() -> G + Send + Sync>,
 ) -> GameOutcome
@@ -248,9 +260,9 @@ where
         let is_a_turn = (cur == 1) == player_a_is_red;
 
         let action = if is_a_turn {
-            get_player_action(&env, player_a_spec, model_sims)
+            get_player_action(&env, player_a_spec, model_sims, model_c_scale)
         } else {
-            get_player_action(&env, player_b_spec, model_sims)
+            get_player_action(&env, player_b_spec, model_sims, model_c_scale)
         };
 
         let Some(a) = action else {
@@ -636,6 +648,7 @@ where
                 params.player_b,
                 player_a_is_red,
                 params.model_sims,
+                params.config.c_scale,
                 game_seed,
                 &params.make_env,
             )

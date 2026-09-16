@@ -13,10 +13,11 @@
 //   cargo run --release --features onnx --example onnx_sims_curve -- \
 //     --model <model.onnx> --opponent random --policy-only --games 100
 //
-// 注意：评估路径的 MCTS 参数由 match_core::model_mcts_action 固定为
-// c_scale=0.25 / max_considered_actions=16，而 banqi-tauri 的 MctsOnnx 对手用
-// GumbelConfig::with_search_scale（c_scale=1.0）。二者不完全等价，本曲线用于
-// 判断「搜索规模 → 强度」的趋势与饱和点。
+// 注意：评估路径的 MCTS 参数由 match_core::model_mcts_action 设定：
+// c_scale 取自 SelfPlayConfig.c_scale（默认 1.0，与自对弈生成路径同口径，
+// 可用 --config 或 --mcts-sims 之外的 selfplay.c_scale 覆盖）、
+// max_considered_actions 固定为 16。本曲线用于判断「搜索规模 → 强度」的
+// 趋势与饱和点。
 
 use std::sync::Arc;
 use std::time::Instant;
