@@ -14,4 +14,6 @@ pub use match_core::{
     AsDarkChessRef, MatchParams, MatchResult, PlayerSpec, SeedableEnv, run_match_core,
 };
 pub use codec::{SCHEMA_VERSION, encode_episode_batch};
-pub use reanalysis::{ReanalysisItem, ReanalysisReport, run_reanalysis};
+pub use reanalysis::{
+    PAYLOAD_VERSION, ReanalysisItem, ReanalysisReport, decode_payload, run_reanalysis,
+};

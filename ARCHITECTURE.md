@@ -20,6 +20,12 @@
 
 ## 变更记录
 
+- 2026-09-16：**局面重搜任务类型接入（N9 阶段 3）**：
+  - **proto**（三份副本同步、Go pb 与 Python pb2 已按各自记录的配方重新生成）：`TaskKind` 新增 `TASK_REANALYSIS`、`TaskResponse.reanalysis_payload`、`SubmitReanalysis` RPC（训练侧发起）。
+  - **registry**：`SchedulerTask` 新增 `reanalysis_payload`（不透明字节，由服务端下发）；权重按 `network_key` 下载与既有一致，变体/类别校验沿用同一条路径（重搜任务恒为 `DATA_RESNET`）。
+  - **bin**：新增 `TaskKind::TaskReanalysis` 分支 —— 解码载荷 → 按变体分派 → `run_reanalysis` → 走常规 `submit_episode_report`（`EpisodeBatch{data_kind: DataResnet, winner: 0}`）。0 位置产出时打印失败/跳过计数并**不上报**（避免触发"0 局产出"的批次报错），其余情况日志给出成功/失败/跳过三段计数。
+  - **载荷编解码**：`reanalysis.rs` 新增 `encode_payload` / `decode_payload`（`u8 version | u32 count | 每项 u32 snapshot_len + snapshot + u8 flags + i32 winner + f32 health`），与训练侧 `banqi_training/reanalysis.py::encode_payload` 逐字节镜像；两侧各有一个固定样例的十六进制断言互为锁（Rust `payload_layout_matches_python_encoder` / Python `test_payload_layout_matches_rust_decoder`）。
+
 - 2026-09-16：**局面快照与跨进程重搜（reanalysis）执行端（N9 阶段 2）**：
   - **快照契约**：`banqi-core` 新增 `env/snapshot.rs`（`PositionSnapshot` + `SnapshotEnv` trait，手写紧凑字节编解码，版本号 + 全边界检查）；本仓库用 `collect_positions` 在记录时把每步 `PositionSnapshot::encode()` 写入 `GameEpisode.positions`（单树路径与批量路径都收集，推入点与样本严格同点，`finalize_episode` 再做长度校验、不齐即丢侧信道并告警）。
   - **线格式**：`EpisodeRecord` 新增 `repeated bytes positions = 22`（空 = 未收集）；`codec::encode_episode` 校验「快照数 == 样本数」后才编码（不对齐即整批报错）；训练端 `episode_codec.py` 解码为等长 bytes 列表或 `None`（新增 `tests/test_episode_codec.py` 契约测试）。三份 proto 副本（banqi-collector / banqi-scheduler / banqi-training）已同步，Python pb2 已按 `proto/__init__.py` 记录的配方重新生成。

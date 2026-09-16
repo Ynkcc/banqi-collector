@@ -1,7 +1,7 @@
 // src/bin/collector.rs — 分布式采集进程（banqi-collector，仅 scheduler backend）
 //
 // 自 rust_4x8/src/bin/collector.rs 迁入（banqi-collector 拆分），仅保留分布式形态：
-// SchedulerRegistry（gRPC GetTask + R2 预签名直传；selfplay/rating 双任务）。
+// SchedulerRegistry（gRPC GetTask + R2 预签名直传；selfplay / rating / reanalysis 三类任务）。
 // 本地采集（LocalRegistry/LocalEpisodeStore）留在 rust_4x8 主仓库。
 //
 // 配置：分层加载（默认值 → TOML → CLI 覆盖）见 src/config.rs；--config-dump 可落盘快照。
@@ -16,16 +16,16 @@ use rayon::ThreadPoolBuilder;
 
 use banqi_collector::config::{CliOverrides, CollectorConfig};
 use banqi_collector::pipeline::self_play::{
-    AsDarkChessRef, GameEpisode, MatchParams, MatchResult, PlayerSpec, SeedableEnv,
-    SelfPlayConfig, run_match_core,
+    AsDarkChessRef, GameEpisode, MatchParams, MatchResult, PlayerSpec, ReanalysisReport,
+    SeedableEnv, SelfPlayConfig, decode_payload, run_match_core, run_reanalysis,
 };
 use banqi_collector::registry::{
     CLIENT_VERSION, EpisodeBatch, MatchReport, SchedulerRegistry,
 };
-use banqi_collector::pb::TaskKind;
+use banqi_collector::pb::{DataKind, TaskKind};
 use banqi_core::core::env::traits::GameEnv;
 use banqi_core::core::env::{
-    CurriculumEnv, DarkChessEnv,
+    CurriculumEnv, DarkChessEnv, SnapshotEnv,
     variants::{Game4x4Env, MiniDarkChessEnv},
 };
 use banqi_engine::inference::onnx::{OnnxModel, OnnxEvaluator};
@@ -192,6 +192,44 @@ fn run_scheduler(
                     pairs,
                 });
             }
+            TaskKind::TaskReanalysis => {
+                // 用当前 best 网络对训练侧下发的历史局面重跑 MCTS（跨进程 reanalysis）。
+                // 产物「一局面一条 1 样本 episode」走常规上报通道，训练侧无需特殊处理。
+                let model = registry.model(&task.network_sha)?;
+                let service_t0 = Instant::now();
+                let report = reanalyze_variant_dispatch(
+                    &task.variant,
+                    model,
+                    &selfplay,
+                    &task.reanalysis_payload,
+                    pool,
+                )?;
+                let positions = report.episodes.len();
+                let elapsed = service_t0.elapsed().as_secs_f64();
+                if positions == 0 {
+                    // 不产出任何数据：重复日志说明原因（载荷非法 / 全部终局 / 推理失败）
+                    eprintln!(
+                        "[iter {iteration}] reanalysis task={} ⚠️ 0 位置产出（失败 {} / 跳过 {}），本批不上报，耗时 {elapsed:.1}s",
+                        task.task_id, report.failed, report.skipped
+                    );
+                    iteration += 1;
+                    continue;
+                }
+                println!(
+                    "[iter {iteration}] reanalysis task={} 🔁 {positions} 位置重搜（失败 {} / 跳过 {}）计算耗时 {elapsed:.1}s",
+                    task.task_id, report.failed, report.skipped
+                );
+                registry.add_completed_games(positions);
+                registry.submit_episode_report(EpisodeBatch {
+                    task_id: task.task_id.clone(),
+                    network_sha: task.network_sha.clone(),
+                    variant: task.variant.clone(),
+                    data_kind: DataKind::DataResnet,
+                    winner: 0, // 重搜不产生对局结果，聚合胜方恒 0
+                    episodes: report.episodes,
+                    nnue_episodes: Vec::new(),
+                });
+            }
             TaskKind::TaskNone => unreachable!("get_task 已过滤 TASK_NONE"),
         }
         iteration += 1;
@@ -246,6 +284,45 @@ fn run_variant_dispatch(
         "4x2" => run_games::<MiniDarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, batched, pool),
         other => anyhow::bail!("未知变体: {other}（可选 4x8 / 4x4 / 4x2）"),
     }
+}
+
+/// 按变体分发局面重搜（载荷只在运行时才知道变体，与 run_variant_dispatch 同构）。
+fn reanalyze_variant_dispatch(
+    variant: &str,
+    model: Arc<OnnxModel>,
+    config: &SelfPlayConfig,
+    payload: &[u8],
+    pool: &rayon::ThreadPool,
+) -> Result<ReanalysisReport> {
+    match variant {
+        "4x8" => reanalyze_games::<DarkChessEnv>(model, config, payload, pool),
+        "4x4" => reanalyze_games::<Game4x4Env>(model, config, payload, pool),
+        "4x2" => reanalyze_games::<MiniDarkChessEnv>(model, config, payload, pool),
+        other => anyhow::bail!("未知变体: {other}（可选 4x8 / 4x4 / 4x2）"),
+    }
+}
+
+/// 局面重搜的泛型主干：解码载荷 → 用给定模型逐局面重跑 MCTS。
+///
+/// 变体一致性由 `G::from_snapshot` 保证（快照变体与本变体不符即拒绝该条）。
+fn reanalyze_games<G>(
+    model: Arc<OnnxModel>,
+    config: &SelfPlayConfig,
+    payload: &[u8],
+    pool: &rayon::ThreadPool,
+) -> Result<ReanalysisReport>
+where
+    G: GameEnv + SnapshotEnv + Send + Sync + 'static,
+{
+    let items = decode_payload(payload).map_err(|e| anyhow::anyhow!("重搜载荷解码失败: {e}"))?;
+    let evaluator = OnnxEvaluator::<G>::new(model);
+    Ok(run_reanalysis::<G, _>(
+        &items,
+        &evaluator,
+        config,
+        Some(pool),
+        "reanalysis",
+    ))
 }
 
 fn run_games<G>(

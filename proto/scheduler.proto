@@ -29,12 +29,19 @@ message TaskResponse {
   // cache_dir/<network_key>，扩展名即权重格式（onnx / pt / nnue）。
   string network_key = 11;
   string opponent_key = 12;     // rating 任务的对手网络对象键
+  // 重搜任务（TASK_REANALYSIS）携带的历史局面载荷（版本化紧凑编码，格式见
+  // banqi-collector/src/pipeline/self_play/reanalysis.rs 的 encode_payload）。
+  // 其余任务为空。games 字段对重搜任务表示「位置条数」。
+  bytes reanalysis_payload = 13;
 }
 
 enum TaskKind {
   TASK_NONE = 0;      // 无任务，按 message 退避轮询
   TASK_SELFPLAY = 1;
   TASK_RATING = 2;    // gatekeeper / rating 对打
+  // 局面重搜（reanalysis）：用当前 best 网络对下发的历史局面重跑 MCTS，
+  // 产出新的策略/价值目标（一局面一条 1 样本 episode），走 ReportEpisode 常规通道上报。
+  TASK_REANALYSIS = 3;
 }
 
 // 训练数据类别：决定 worker 产哪类记录、trainer 消费哪类对象。
@@ -187,6 +194,22 @@ message ListEpisodesReply {
   bool has_more = 2;
 }
 
+// trainer 提交「局面重搜」任务：把从历史 episode 里攒下的局面快照交给调度器，
+// 由任意 worker 用当前 best 网络重跑 MCTS 刷新训练目标（跨进程 reanalysis）。
+message SubmitReanalysisRequest {
+  string requester = 1;   // 提交方标识（日志用）
+  string variant = 2;     // 必须与服务端 VARIANT 一致，否则拒绝（防串变体）
+  int32 mcts_sims = 3;    // 重搜模拟次数；0 = 用 worker 自对弈配置的默认值
+  uint32 positions = 4;   // 位置条数（仅统计/展示；权威值在 payload 内）
+  bytes payload = 5;      // 位置载荷（见 reanalysis.rs 的 encode_payload）
+}
+
+message SubmitReanalysisReply {
+  bool accepted = 1;
+  string message = 2;
+  uint64 queued_positions = 3;   // 入队后待重搜的位置总数（含本次）
+}
+
 // 调度器全局信息（trainer 启动时获取变体，无需命令行传入）
 message GetInfoRequest {}
 
@@ -296,4 +319,6 @@ service SchedulerService {
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
   rpc SignNetworkUpload (SignNetworkUploadRequest) returns (SignNetworkUploadAck);
   rpc ListEpisodes (ListEpisodesRequest) returns (ListEpisodesReply);
+  // trainer 提交局面重搜任务（异步：入队后由 GetTask 分发给任意 worker）
+  rpc SubmitReanalysis (SubmitReanalysisRequest) returns (SubmitReanalysisReply);
 }

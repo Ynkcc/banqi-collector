@@ -135,6 +135,80 @@ where
 }
 
 // ============================================================================
+// 载荷编解码（trainer ↔ 调度器 ↔ collector 传输用）
+//
+// 布局（小端，版本号在前，解码端遇到不认识的版本直接拒绝）：
+//   u8  version | u32 count |
+//   每项: u32 snapshot_len | snapshot | u8 flags | i32 winner | f32 health_diff
+// flags: bit0 = winner 有效，bit1 = health_diff 有效（原局无该字段时置 0）。
+// Python 侧镜像实现见 banqi_training/reanalysis.py::encode_payload。
+// ============================================================================
+
+/// 重搜载荷格式版本。
+pub const PAYLOAD_VERSION: u8 = 1;
+
+const FLAG_HAS_WINNER: u8 = 0b01;
+const FLAG_HAS_HEALTH: u8 = 0b10;
+
+/// 编码重搜载荷（Rust 侧用于测试与自检；生产编码方是 trainer 的 Python 实现）。
+pub fn encode_payload(items: &[ReanalysisItem]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + items.len() * 160);
+    out.push(PAYLOAD_VERSION);
+    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    for item in items {
+        out.extend_from_slice(&(item.snapshot.len() as u32).to_le_bytes());
+        out.extend_from_slice(&item.snapshot);
+        let flags = (if item.winner.is_some() { FLAG_HAS_WINNER } else { 0 })
+            | (if item.health_diff_red.is_some() { FLAG_HAS_HEALTH } else { 0 });
+        out.push(flags);
+        out.extend_from_slice(&item.winner.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&item.health_diff_red.unwrap_or(0.0).to_le_bytes());
+    }
+    out
+}
+
+/// 解码重搜载荷；任何结构性问题返回 Err（由调用方按载荷非法处理，不产出数据）。
+pub fn decode_payload(bytes: &[u8]) -> Result<Vec<ReanalysisItem>, String> {
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize| -> Result<&[u8], String> {
+        let end = pos
+            .checked_add(n)
+            .ok_or_else(|| "载荷长度溢出".to_string())?;
+        let slice = bytes
+            .get(*pos..end)
+            .ok_or_else(|| format!("载荷长度不足（需要 {n} 字节，剩余 {}）", bytes.len().saturating_sub(*pos)))?;
+        *pos = end;
+        Ok(slice)
+    };
+
+    let version = take(&mut pos, 1)?[0];
+    if version != PAYLOAD_VERSION {
+        return Err(format!("载荷版本不支持: {version}（本构建支持 {PAYLOAD_VERSION}）"));
+    }
+    let mut b4 = [0u8; 4];
+    b4.copy_from_slice(take(&mut pos, 4)?);
+    let count = u32::from_le_bytes(b4) as usize;
+
+    let mut items = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        b4.copy_from_slice(take(&mut pos, 4)?);
+        let snap_len = u32::from_le_bytes(b4) as usize;
+        let snapshot = take(&mut pos, snap_len)?.to_vec();
+        let flags = take(&mut pos, 1)?[0];
+        b4.copy_from_slice(take(&mut pos, 4)?);
+        let winner = i32::from_le_bytes(b4);
+        b4.copy_from_slice(take(&mut pos, 4)?);
+        let health = f32::from_le_bytes(b4);
+        items.push(ReanalysisItem {
+            snapshot,
+            winner: if flags & FLAG_HAS_WINNER != 0 { Some(winner) } else { None },
+            health_diff_red: if flags & FLAG_HAS_HEALTH != 0 { Some(health) } else { None },
+        });
+    }
+    Ok(items)
+}
+
+// ============================================================================
 // 测试
 // ============================================================================
 
@@ -247,6 +321,47 @@ mod tests {
             assert!((sum - 1.0).abs() < 1e-3, "策略概率和 {sum} 不为 1");
             assert!(*action < policy.len(), "动作索引越界");
         }
+    }
+
+    /// 载荷编解码互逆；版本不符 / 截断必须报错（跨进程传输的根基）。
+    #[test]
+    fn payload_codec_roundtrip() {
+        let items = vec![
+            ReanalysisItem { snapshot: vec![1, 2, 3], winner: Some(1), health_diff_red: Some(0.25) },
+            ReanalysisItem { snapshot: vec![9], winner: Some(0), health_diff_red: None },
+            ReanalysisItem { snapshot: Vec::new(), winner: None, health_diff_red: Some(-0.5) },
+        ];
+        let bytes = encode_payload(&items);
+        let decoded = decode_payload(&bytes).expect("载荷解码失败");
+        assert_eq!(decoded.len(), items.len());
+        for (got, want) in decoded.iter().zip(&items) {
+            assert_eq!(got.snapshot, want.snapshot);
+            assert_eq!(got.winner, want.winner);
+            assert_eq!(got.health_diff_red, want.health_diff_red);
+        }
+
+        let mut bad_version = bytes.clone();
+        bad_version[0] = PAYLOAD_VERSION + 1;
+        assert!(decode_payload(&bad_version).is_err());
+        assert!(decode_payload(&bytes[..bytes.len() - 1]).is_err());
+        assert!(decode_payload(&[]).is_err());
+        // 长度字段被夸大 → 越界而非 panic
+        let mut bad_len = bytes.clone();
+        bad_len[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_payload(&bad_len).is_err());
+    }
+
+    /// 与 Python 侧同一固定样例（banqi-training/tests/test_reanalysis.py）互为锁：
+    /// 两侧字节布局必须一致，否则跨进程重搜会在运行期整批报错。
+    #[test]
+    fn payload_layout_matches_python_encoder() {
+        let bytes = encode_payload(&[ReanalysisItem {
+            snapshot: vec![0x01, 0x02],
+            winner: Some(1),
+            health_diff_red: Some(0.5),
+        }]);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "01010000000200000001020301000000 0000003f".replace(' ', ""));
     }
 
     #[test]

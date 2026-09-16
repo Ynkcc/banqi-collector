@@ -102,6 +102,8 @@ pub struct SchedulerTask {
     pub initial_revealed: Option<usize>,
     /// 本任务要产的数据类别（服务端下发；已在 get_task 校验为本构建支持的值）
     pub data_kind: DataKind,
+    /// 重搜任务（TASK_REANALYSIS）携带的历史局面载荷；其余任务为空。
+    pub reanalysis_payload: Vec<u8>,
 }
 
 /// 一批自对弈 episode 的上报载荷（编码/gzip/sha256 在后台完成）。
@@ -358,6 +360,7 @@ impl SchedulerRegistry {
             variant,
             initial_revealed,
             data_kind,
+            reanalysis_payload: resp.reanalysis_payload.clone(),
         };
 
         // rating 任务：对手网络同样需就绪（各自的对象键按格式区分）
