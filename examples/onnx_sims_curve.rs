@@ -108,6 +108,10 @@ struct Args {
     /// 选手 A 的模拟数列表（逗号分隔）
     #[arg(long, default_value = "64,256,1024,4096")]
     sims: String,
+    /// 选手 B（对手）的模拟数。缺省 = 与 --sims 相同；用于「同一模型、不同搜索深度」
+    /// 的 Elo 阶梯测量（B4：搜索深度 → 老师强度）。
+    #[arg(long)]
+    opponent_sims: Option<usize>,
     /// 每档对局数（逐局换色）
     #[arg(long, default_value_t = 40)]
     games: usize,
@@ -243,6 +247,7 @@ fn main() -> Result<()> {
             record_episodes: false,
             batched: false, // 评估路径不产生 episode，批量（记录模式专用）不适用
             model_sims: sims,
+            opponent_sims: args.opponent_sims,
             thread_pool: Some(&pool),
             make_env: make_env.clone(),
         });

@@ -223,6 +223,7 @@ fn play_one_game<G>(
     player_b_spec: &PlayerSpec<G>,
     player_a_is_red: bool,
     model_sims: usize,
+    opponent_sims: usize,
     model_c_scale: f32,
     game_seed: Option<u64>,
     make_env: &Arc<dyn Fn() -> G + Send + Sync>,
@@ -247,7 +248,7 @@ where
         let action = if is_a_turn {
             get_player_action(&env, player_a_spec, model_sims, model_c_scale)
         } else {
-            get_player_action(&env, player_b_spec, model_sims, model_c_scale)
+            get_player_action(&env, player_b_spec, opponent_sims, model_c_scale)
         };
 
         let Some(a) = action else {
@@ -600,6 +601,9 @@ pub struct MatchParams<'a, G: GameEnv> {
     pub batched: bool,
     /// 模型选手的 MCTS 模拟数（评估路径）。
     pub model_sims: usize,
+    /// 选手 B（对手）的 MCTS 模拟数。None = 与 `model_sims` 相同（旧行为）。
+    /// 用于「同一模型、不同搜索深度」的 Elo 阶梯测量（B4：搜索深度 → 老师强度）。
+    pub opponent_sims: Option<usize>,
     /// 线程池：Some = 原生多线程（Rust 持模型 / 规则），None = 单线程。
     pub thread_pool: Option<&'a rayon::ThreadPool>,
     /// 环境工厂：每局调用一次（支持课程参数注入的闭包形式）。
@@ -647,6 +651,7 @@ where
                 params.player_b,
                 player_a_is_red,
                 params.model_sims,
+                params.opponent_sims.unwrap_or(params.model_sims),
                 params.config.c_scale,
                 game_seed,
                 &params.make_env,

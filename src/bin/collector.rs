@@ -363,6 +363,7 @@ where
         record_episodes,
         batched,
         model_sims: config.mcts_sims,
+        opponent_sims: None,
         thread_pool: Some(pool),
         make_env,
     });
