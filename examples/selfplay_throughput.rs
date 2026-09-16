@@ -1,7 +1,7 @@
 // banqi-collector/examples/selfplay_throughput.rs
 // 自对弈数据生成速率基准：复刻 bin/collector.rs 的生产配置（SelfPlayConfig 字面量、
 // PlayerSpec::ModelEval 双方同网、record_episodes=true、局级 rayon 并行），
-// 只计「自对弈产出 episode」与「jsonl.gz 序列化」两段耗时，不含 gRPC/R2。
+// 只计「自对弈产出 episode」与「EpisodeBatch 二进制编码 + gzip」两段耗时，不含 gRPC/R2。
 //
 // 用法（须带 onnx feature）：
 //   cargo run --release --features onnx --example selfplay_throughput -- \
@@ -20,7 +20,7 @@ use flate2::Compression;
 
 use banqi_collector::pipeline::self_play::{
     AsDarkChessRef, GameEpisode, MatchParams, PlayerSpec, ScenarioType, SeedableEnv,
-    SelfPlayConfig, serialize::episode_to_dict_json, run_match_core,
+    SelfPlayConfig, encode_episode_batch, run_match_core,
 };
 use banqi_core::core::env::traits::GameEnv;
 use banqi_core::core::env::variants::{Game4x4Env, MiniDarkChessEnv};
@@ -127,13 +127,12 @@ where
     })
 }
 
-/// 与 bin/collector.rs::episodes_gz 等价的序列化耗时测量。
-fn episodes_gz(episodes: &[GameEpisode]) -> Result<Vec<u8>> {
+/// 与 registry::batch_gz 等价的编码耗时测量（EpisodeBatch 二进制 + gzip）。
+fn episodes_gz(variant: &str, episodes: &[GameEpisode]) -> Result<Vec<u8>> {
     use std::io::Write;
+    let raw = encode_episode_batch(variant, episodes, &[])?;
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-    for ep in episodes {
-        writeln!(gz, "{}", episode_to_dict_json(ep)).context("序列化 episode 失败")?;
-    }
+    gz.write_all(&raw).context("gzip 写入失败")?;
     gz.finish().context("gzip 收尾失败")
 }
 
@@ -212,7 +211,7 @@ fn main() -> Result<()> {
         let samples: usize = r.episodes.iter().map(|e| e.samples.len()).sum();
 
         let t1 = Instant::now();
-        let gz = episodes_gz(&r.episodes)?;
+        let gz = episodes_gz(&args.variant, &r.episodes)?;
         let ser_s = t1.elapsed().as_secs_f64();
 
         let gen_games_s = n_games as f64 / gen_s;

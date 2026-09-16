@@ -19,12 +19,16 @@ message TaskResponse {
   TaskKind kind = 2;
   string network_sha = 3;       // 主网络（训练网络）
   string opponent_sha = 4;      // rating 对打时的对手网络；selfplay 为空
-  string network_url = 5;       // R2 预签名下载 URL（主网络）
+  string network_url = 5;       // R2 预签名下载 URL（主网络）；空 = 本地已有缓存
   string opponent_url = 6;      // 对手网络下载 URL
   string network_sha_remote = 7;  // 服务端当前 best sha（用于本地缓存比对）
   int32 games = 8;              // 本批对局数
   SelfPlayParams params = 9;
   string message = 10;          // 无任务时的说明（task_waiting 等）
+  // 网络对象键（networks/<sha>.<ext>）：恒下发，worker 的本地缓存路径即
+  // cache_dir/<network_key>，扩展名即权重格式（onnx / pt / nnue）。
+  string network_key = 11;
+  string opponent_key = 12;     // rating 任务的对手网络对象键
 }
 
 enum TaskKind {
@@ -58,7 +62,7 @@ message EpisodeAck {
   bool accepted = 1;
   string message = 2;
   string upload_url = 3;        // 预签名 PUT URL；accepted=false 时为空
-  string object_key = 4;        // R2 对象键 episodes/<sha>/<uuid>.jsonl.gz
+  string object_key = 4;        // R2 对象键 episodes/<sha>/<uuid>.epb.gz
 }
 
 // 网络请求：sha 为空 = 拉取当前 best
@@ -72,6 +76,7 @@ message NetworkInfo {
   int64 created_at = 3;
   bool is_best = 4;
   string game_data = 5;         // 训练侧附加信息（parent sha 等），JSON
+  string key = 6;               // 对象键 networks/<sha>.<ext>（供 worker 预取缓存命名）
 }
 
 // trainer（GPU 机）注册新网络 → 触发 gatekeeper 对打
@@ -80,6 +85,9 @@ message RegisterNetworkRequest {
   string parent_sha = 2;
   string upload_url = 3;        // trainer 已直传 R2，这里登记元数据
   string notes = 4;
+  // 权重格式（onnx / pt / nnue）：与 SignNetworkUploadRequest.format 一致，
+  // 决定对象键扩展名；两处必须由 upload 方用同一来源填写。
+  string format = 5;
 }
 
 message RegisterNetworkAck {
@@ -139,13 +147,15 @@ message SignNetworkUploadRequest {
   string sha = 2;               // 网络内容 sha256（决定对象键与去重）
   int64 content_length = 3;
   string content_sha256 = 4;
+  // 权重格式（onnx / pt / nnue）：决定对象键扩展名，供 worker 按格式分派加载器。
+  string format = 5;
 }
 
 message SignNetworkUploadAck {
   bool accepted = 1;
   string message = 2;
   string upload_url = 3;        // 预签名 PUT；accepted=false 时为空
-  string object_key = 4;        // networks/<sha>.bin
+  string object_key = 4;        // networks/<sha>.<format>
 }
 
 // trainer 拉取已登记 episode 的预签名 GET 列表（游标分页）
@@ -170,6 +180,91 @@ message GetInfoRequest {}
 
 message GetInfoReply {
   string variant = 1;
+}
+
+// ============================================================================
+// 训练数据记录（episode 对象载荷）
+//
+// worker 把一批 episode 编码为 EpisodeBatch → gzip → 直传 R2，对象键
+// `episodes/<network_sha>/<data_id>.epb.gz`。本组消息是训练数据的唯一字段
+// 契约；调度器只登记元数据、不解析对象内容。
+//
+// 约定：
+// - 字段号只增不改；任何破坏性变更必须提升 schema_version，训练端遇到不认识
+//   的版本直接拒绝（不静默降级）。
+// - 所有 bytes 字段是「稠密小端缓冲区」，训练端用 np.frombuffer 零拷贝还原，
+//   不做逐元素文本解析。
+// - 位打包（boards_bits / action_masks_bits）：字节内高位对应较小下标
+//   （与 numpy.unpackbits(bitorder='big') 一致），行主序，尾部补 0。
+// ============================================================================
+
+message EpisodeBatch {
+  uint32 schema_version = 1;
+  string variant = 2;                    // 4x8 / 4x4 / 4x2（训练端据此校验变体一致）
+  repeated EpisodeRecord episodes = 3;   // Gumbel MCTS 自对弈记录
+  repeated NnueEpisodeRecord nnue_episodes = 4;  // Expectimax 强自对弈记录
+}
+
+// ResNet 网络（Gumbel MCTS）自对弈的完整记录，字段与训练样本一一对应。
+message EpisodeRecord {
+  uint32 steps = 1;            // 有效训练样本数（下述各张量的第 0 维）
+  uint32 board_channels = 2;   // 棋盘特征通道数（= 变体 board_channels）
+  uint32 board_rows = 3;
+  uint32 board_cols = 4;
+  uint32 scalar_count = 5;
+  uint32 action_space = 6;
+  // steps × board_channels × ceil(rows*cols/8) 的 0/1 位平面。
+  bytes boards_bits = 7;
+  // steps × scalar_count 的 f32（标量特征，稠密）。
+  bytes scalars = 8;
+  // steps × action_space 的 f32（改进策略概率 pi_target，稠密；无法稀疏化）。
+  bytes policies = 9;
+  // steps × ceil(action_space/8) 的 0/1 位图（合法动作掩码）。
+  bytes action_masks_bits = 10;
+  bytes mcts_values = 11;      // steps × f32（根节点价值，行棋方视角）
+  bytes completed_qs = 12;     // steps × f32（所选动作的 Q）
+  bytes game_results = 13;     // steps × f32（终局回报，行棋方视角）
+  bytes health_diffs = 14;     // steps × f32（终局归一化血量差，行棋方视角）
+  bytes root_visits = 15;      // steps × u32（根节点访问次数）
+  bytes actions = 16;          // steps × u32（实际落子动作索引）
+  bytes is_full_search = 17;   // steps × u8（0/1：算力随机化的 Full Search 标记）
+  uint32 game_length = 18;     // 实际对局步数（出错路径下 samples 为空，可能 > steps）
+  optional int32 winner = 19;  // 1 红 / -1 黑 / 0 平；缺省 = 本局作废
+  optional float health_diff_red = 20;  // 红方视角的终局血量差
+  // 可选：自对弈开启 collect_nnue_features 时存在（供 NNUE 蒸馏）。
+  NnueFeatures nnue = 21;
+}
+
+// NNUE 特征布局元信息（由 env.config 推导，训练端免硬编码还原维度）。
+message NnueMeta {
+  uint32 feature_dim = 1;
+  uint32 states_per_square = 2;
+  uint32 bag_stride = 3;
+  uint32 num_active = 4;
+  uint32 total_positions = 5;
+}
+
+// 每步双视角稀疏特征索引：按步顺序把 mover 段与 opponent 段拼进 indices，
+// offsets 为前缀和（长度 2*steps+1），第 i 步：
+//   mover    = indices[offsets[2i]   : offsets[2i+1]]
+//   opponent = indices[offsets[2i+1] : offsets[2i+2]]
+message NnueFeatures {
+  NnueMeta meta = 1;
+  bytes indices = 2;   // 全部索引（u32）顺序拼接
+  bytes offsets = 3;   // (2*steps+1) × u32 前缀和
+}
+
+// Expectimax 强自对弈的 NNUE 专属记录（无 ResNet 大张量）。
+message NnueEpisodeRecord {
+  NnueMeta meta = 1;
+  uint32 steps = 2;
+  bytes features_indices = 3;  // 同 NnueFeatures.indices
+  bytes features_offsets = 4;  // 同 NnueFeatures.offsets
+  bytes search_values = 5;     // steps × f32（搜索根值，行棋方视角）
+  bytes players = 6;           // steps × i32（1 红 / -1 黑）
+  bytes actions = 7;           // steps × u32
+  uint32 game_length = 8;
+  optional int32 winner = 9;
 }
 
 service SchedulerService {

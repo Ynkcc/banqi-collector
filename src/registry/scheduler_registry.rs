@@ -4,15 +4,16 @@
 // ONNX 模型类型由 crate::inference::onnx 切换为 banqi-engine 的实现。
 //
 // 语义：get_task（= GetTask，无任务返回 None 由调用方退避轮询）、
-// model（= ensure_model，按 sha 惰性下载 + 加载 onnx，进程内缓存）、
+// model（= 按 sha 惰性下载 + 按对象键扩展名分派加载，进程内缓存会话池）、
 // submit_episode_report（ReportEpisode 签发预签名 PUT → HTTP 直传 R2）、
 // submit_match_report（rating 五项计数上报，服务端 GSPRT 判停晋级）。
 // 模型换网感知：GetTask 返回的 best sha 变化即触发新模型下载加载。
+// 本地缓存路径与权重格式均来自服务端下发的对象键（networks/<sha>.<ext>）。
 //
 // 并发形态（2026-09-15 重构）：
 // - 长连接：`Channel` 只建一次并复用（原先每次 RPC 都重新 connect），
 //   tonic 的 Channel 自带重连，调度器重启后无需额外处理。
-// - 异步上报：gRPC + JSON 序列化 + gzip + sha256 + R2 PUT 全部丢到后台 tokio 任务，
+// - 异步上报：gRPC + EpisodeBatch 编码 + gzip + sha256 + R2 PUT 全部丢到后台 tokio 任务，
 //   主循环（拉任务 → rayon 跑批）不再被 I/O 阻塞，计算与上传重叠。
 // - 背压：`report_slots` 信号量限制在途批数（同时约束驻留内存），名额用尽时
 //   提交侧阻塞，主循环自然不会再拉下一批。
@@ -34,11 +35,8 @@ use tonic::transport::{Channel, Endpoint};
 
 use banqi_engine::inference::onnx::OnnxModel;
 
-use crate::pipeline::self_play::GameEpisode;
-
-pub mod pb {
-    tonic::include_proto!("scheduler");
-}
+use crate::pb;
+use crate::pipeline::self_play::{GameEpisode, NnueEpisode, encode_episode_batch};
 
 use pb::scheduler_service_client::SchedulerServiceClient;
 use pb::{EpisodeMeta, HeartbeatRequest, MatchResult as PbMatchResult, NetworkRequest, TaskKind, TaskRequest};
@@ -94,13 +92,17 @@ pub struct SchedulerTask {
     pub initial_revealed: Option<usize>,
 }
 
-/// 一批自对弈 episode 的上报载荷（序列化/gzip/sha256 在后台完成）。
+/// 一批自对弈 episode 的上报载荷（编码/gzip/sha256 在后台完成）。
 pub struct EpisodeBatch {
     pub task_id: String,
     pub network_sha: String,
+    /// 变体标识（服务端下发）：编码进记录供训练端校验数据未串变体
+    pub variant: String,
     /// 批内聚合胜方（1 红 / -1 黑 / 0 平；调度端仅作日志统计）
     pub winner: i32,
     pub episodes: Vec<GameEpisode>,
+    /// Expectimax 强自对弈记录（与 episodes 互斥出现；当前采集路径恒为空）
+    pub nnue_episodes: Vec<NnueEpisode>,
 }
 
 /// rating 结果上报载荷（五项成对计数）。
@@ -123,6 +125,8 @@ pub struct SchedulerRegistry {
     cfg: SchedulerConfig,
     /// 本地已加载的模型缓存（sha -> 会话池）
     models: HashMap<String, Arc<OnnxModel>>,
+    /// 网络对象键表（sha -> networks/<sha>.<ext>）：本地缓存路径与权重格式来源
+    network_keys: HashMap<String, String>,
     /// 当前持有的网络 sha（GetTask 时上报，服务端据此免发下载 URL）
     current_network: String,
     /// 心跳共享状态：累计完成局数
@@ -182,6 +186,7 @@ impl SchedulerRegistry {
             http,
             cfg,
             models: HashMap::new(),
+            network_keys: HashMap::new(),
             current_network: String::new(),
             completed_games,
             running_task_id,
@@ -299,8 +304,11 @@ impl SchedulerRegistry {
             return Ok(None);
         }
 
-        // 主网络：sha 变化或本地无缓存时经预签名 URL 下载
-        self.ensure_downloaded(&resp.network_sha, &resp.network_url)?;
+        // 主网络：对象键恒下发（本地缓存命名 + 权重格式判定），URL 仅在需拉取时存在
+        if resp.network_key.is_empty() {
+            anyhow::bail!("服务端未下发 network_key（调度器版本过旧），无法确定权重格式");
+        }
+        self.ensure_downloaded(&resp.network_sha, &resp.network_key, &resp.network_url)?;
 
         let (mcts_sims, variant, initial_revealed) =
             resp.params.as_ref().map_or((0, String::new(), None), |p| {
@@ -328,9 +336,12 @@ impl SchedulerRegistry {
             initial_revealed,
         };
 
-        // rating 任务：对手网络同样需就绪
+        // rating 任务：对手网络同样需就绪（各自的对象键按格式区分）
         if task.kind == TaskKind::TaskRating {
-            self.ensure_downloaded(&task.opponent_sha, &resp.opponent_url)?;
+            if resp.opponent_key.is_empty() {
+                anyhow::bail!("服务端未下发 opponent_key（调度器版本过旧），无法确定对手权重格式");
+            }
+            self.ensure_downloaded(&task.opponent_sha, &resp.opponent_key, &resp.opponent_url)?;
         }
 
         println!(
@@ -341,9 +352,10 @@ impl SchedulerRegistry {
     }
 
     /// 下载（若本地缓存缺失）指定 sha 的网络文件，并更新 current_network。
+    /// 本地路径由对象键决定（cache_dir/<key>），扩展名即权重格式。
     /// SRI 完整性校验：缓存命中与下载后都做 sha256 比对，不符则删除缓存并拒绝使用。
-    fn ensure_downloaded(&mut self, sha: &str, url: &str) -> Result<()> {
-        let path = network_path(&self.cfg.cache_dir, sha);
+    fn ensure_downloaded(&mut self, sha: &str, key: &str, url: &str) -> Result<()> {
+        let path = network_path(&self.cfg.cache_dir, key);
         if path.is_file() {
             if let Err(e) = verify_file_sha256(&path, sha) {
                 println!(
@@ -355,50 +367,65 @@ impl SchedulerRegistry {
         }
         if !path.is_file() {
             if url.is_empty() {
-                anyhow::bail!("网络 {sha} 本地无缓存且服务端未下发下载 URL");
+                anyhow::bail!("网络 {key} 本地无缓存且服务端未下发下载 URL");
             }
             self.rt
                 .block_on(download(&self.http, url, &path, sha, &self.tmp_seq))
-                .with_context(|| format!("下载网络失败: {sha}"))?;
-            println!("[scheduler] ✅ 网络已下载并校验: {sha} -> {}", path.display());
+                .with_context(|| format!("下载网络失败: {key}"))?;
+            println!("[scheduler] ✅ 网络已下载并校验: {key} -> {}", path.display());
         }
         self.current_network = sha.to_string();
+        self.network_keys.insert(sha.to_string(), key.to_string());
         Ok(())
     }
 
     /// 返回指定 sha 的推理模型（含 `sessions` 条并发推理通道）；首次使用时加载。
+    /// 该 sha 必须已经过 `ensure_downloaded`（对象键是定位本地文件的唯一依据）。
     pub fn model(&mut self, sha: &str) -> Result<Arc<OnnxModel>> {
         if let Some(m) = self.models.get(sha) {
             return Ok(Arc::clone(m));
         }
-        let model = self.load_model(sha)?;
+        let key = self
+            .network_keys
+            .get(sha)
+            .with_context(|| format!("网络 {sha} 未登记对象键（未下载），无法定位本地权重"))?
+            .clone();
+        let model = self.load_model(sha, &key)?;
         self.models.insert(sha.to_string(), Arc::clone(&model));
         Ok(model)
     }
 
-    /// 从本地缓存文件加载会话池（每 sha 一份，由 `model` 缓存）。
-    fn load_model(&self, sha: &str) -> Result<Arc<OnnxModel>> {
-        let path = network_path(&self.cfg.cache_dir, sha);
+    /// 从本地缓存加载会话池（每 sha 一份，由 `model` 缓存）。
+    /// 加载器按对象键扩展名分派：权重格式自描述，不靠调用方约定。
+    fn load_model(&self, sha: &str, key: &str) -> Result<Arc<OnnxModel>> {
+        let path = network_path(&self.cfg.cache_dir, key);
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("onnx") => {}
+            Some(other) => anyhow::bail!(
+                "无法加载网络 {key}：本构建仅含 onnx 推理后端（实际权重格式 .{other}）"
+            ),
+            None => anyhow::bail!("网络对象键 {key} 缺少扩展名，无法判定权重格式"),
+        }
         let sessions = self.cfg.sessions.max(1);
         let model = OnnxModel::with_sessions(&path.display().to_string(), &self.cfg.device, sessions)
-            .map_err(|e| anyhow::anyhow!("加载 onnx 失败 ({sha}): {e}"))?;
+            .map_err(|e| anyhow::anyhow!("加载 onnx 失败 ({key}): {e}"))?;
         println!(
-            "[scheduler] 模型 {sha} 就绪：{} 条并发推理通道（device={}）",
+            "[scheduler] 模型 {sha} 就绪：{} 条并发推理通道（device={}，权重 {key}）",
             model.session_count(),
             self.cfg.device
         );
         Ok(Arc::new(model))
     }
 
-    /// 查询当前 best 网络（供复用/调试）。
-    pub fn get_best_network(&self) -> Result<Option<(String, String)>> {
+    /// 查询当前 best 网络（供复用/调试）：返回 (sha, 对象键, 预签名 URL)。
+    pub fn get_best_network(&self) -> Result<Option<(String, String, String)>> {
         let mut client = self.client();
         let info = self
             .rt
             .block_on(async move { client.get_network(NetworkRequest { sha: String::new() }).await })
             .with_context(|| "GetNetwork 调用失败".to_string())?
             .into_inner();
-        Ok(Some((info.sha, info.download_url)))
+        Ok(Some((info.sha, info.key, info.download_url)))
     }
 }
 
@@ -412,22 +439,25 @@ async fn report_episode_async(
     worker_id: &str,
     batch: EpisodeBatch,
 ) -> Result<(usize, usize, String)> {
-    let game_count = batch.episodes.len();
-    let total_steps: usize = batch.episodes.iter().map(|e| e.game_length).sum();
+    let EpisodeBatch { task_id, network_sha, variant, winner, episodes, nnue_episodes } = batch;
+    let game_count = episodes.len() + nnue_episodes.len();
+    let total_steps: usize = episodes.iter().map(|e| e.game_length).sum::<usize>()
+        + nnue_episodes.iter().map(|e| e.game_length).sum::<usize>();
 
-    // JSON 序列化 + gzip 是 CPU 密集段，放到 blocking 线程池，避免占住 tokio worker。
-    let episodes = batch.episodes;
-    let gz_body = tokio::task::spawn_blocking(move || episodes_gz(&episodes))
-        .await
-        .context("episode 序列化任务异常退出")??;
+    // 二进制编码 + gzip 是 CPU 密集段，放到 blocking 线程池，避免占住 tokio worker。
+    let gz_body = tokio::task::spawn_blocking(move || {
+        batch_gz(&variant, &episodes, &nnue_episodes)
+    })
+    .await
+    .context("episode 编码任务异常退出")??;
 
     let meta = EpisodeMeta {
         worker_id: worker_id.to_string(),
-        task_id: batch.task_id,
+        task_id,
         game_count: game_count as i32,
         total_steps: total_steps as i32,
-        winner: batch.winner,
-        network_sha: batch.network_sha,
+        winner,
+        network_sha,
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -501,9 +531,10 @@ async fn upload(http: &reqwest::Client, url: &str, body: Vec<u8>) -> Result<()> 
 // 网络缓存
 // ============================================================================
 
-fn network_path(cache_dir: &Path, sha: &str) -> PathBuf {
-    // 与 Go 侧 r2.NetworkKey 对应的本地缓存布局: cache_dir/networks/<sha>.bin
-    cache_dir.join("networks").join(format!("{sha}.bin"))
+/// 本地缓存路径 = cache_dir/<对象键>（与 Go 侧 r2.NetworkKey 一一对应，
+/// 形如 networks/<sha>.onnx；扩展名即权重格式，供加载器分派）。
+fn network_path(cache_dir: &Path, key: &str) -> PathBuf {
+    cache_dir.join(key)
 }
 
 /// 预签名 GET → 临时文件 → 原子替换 → sha256 校验。
@@ -610,8 +641,8 @@ fn spawn_heartbeat(
     });
 }
 
-/// 后台预取 best 网络：命中本地缓存直接跳过，否则 GetNetwork 取 URL 后下载并校验。
-/// 主路径 `ensure_downloaded` 命中后只做 sha256 校验，换网不再阻塞采集。
+/// 后台预取 best 网络：命中本地缓存直接跳过，否则 GetNetwork 取对象键与 URL 后
+/// 下载并校验。主路径 `ensure_downloaded` 命中后只做 sha256 校验，换网不再阻塞采集。
 fn prefetch_network(
     http: &reqwest::Client,
     cfg: &SchedulerConfig,
@@ -622,10 +653,6 @@ fn prefetch_network(
     let http = http.clone();
     let cfg = cfg.clone();
     tokio::spawn(async move {
-        let path = network_path(&cfg.cache_dir, &sha);
-        if path.is_file() {
-            return;
-        }
         let mut client = SchedulerServiceClient::new(channel);
         let info = match client
             .get_network(NetworkRequest { sha: String::new() })
@@ -638,12 +665,19 @@ fn prefetch_network(
                 return;
             }
         };
-        if info.sha != sha || info.download_url.is_empty() {
+        if info.sha != sha || info.download_url.is_empty() || info.key.is_empty() {
+            return;
+        }
+        let path = network_path(&cfg.cache_dir, &info.key);
+        if path.is_file() {
             return;
         }
         match download(&http, &info.download_url, &path, &sha, &tmp_seq).await {
-            Ok(()) => println!("[prefetch] ✅ 已预取 best 网络: {sha}"),
-            Err(e) => println!("[prefetch] ⚠️ 预取 best 网络失败（主路径将重试）: {sha} {e:#}"),
+            Ok(()) => println!("[prefetch] ✅ 已预取 best 网络: {}", info.key),
+            Err(e) => println!(
+                "[prefetch] ⚠️ 预取 best 网络失败（主路径将重试）: {} {e:#}",
+                info.key
+            ),
         }
     });
 }
@@ -652,14 +686,15 @@ fn prefetch_network(
 // 工具
 // ============================================================================
 
-/// episodes 序列化为 jsonl.gz 内存块（与 LocalEpisodeStore 行格式一致）。
-fn episodes_gz(episodes: &[GameEpisode]) -> Result<Vec<u8>> {
-    use crate::pipeline::self_play::serialize::episode_to_dict_json;
+/// 一批 episode 编码为 gzip 压缩的 EpisodeBatch 二进制载荷。
+///
+/// 编码失败（形状不一致 / 非 0/1 特征等契约破裂）时整批作废并向上报错：
+/// 训练数据宁可丢一批也不能静默进入训练。
+fn batch_gz(variant: &str, episodes: &[GameEpisode], nnue_episodes: &[NnueEpisode]) -> Result<Vec<u8>> {
     use std::io::Write;
+    let raw = encode_episode_batch(variant, episodes, nnue_episodes)?;
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-    for ep in episodes {
-        writeln!(gz, "{}", episode_to_dict_json(ep)).context("序列化 episode 失败")?;
-    }
+    gz.write_all(&raw).context("gzip 写入失败")?;
     gz.finish().context("gzip 收尾失败")
 }
 

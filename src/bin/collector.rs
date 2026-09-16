@@ -22,7 +22,7 @@ use banqi_collector::pipeline::self_play::{
 use banqi_collector::registry::{
     CLIENT_VERSION, EpisodeBatch, MatchReport, SchedulerRegistry,
 };
-use banqi_collector::registry::scheduler_registry::pb::TaskKind;
+use banqi_collector::pb::TaskKind;
 use banqi_core::core::env::traits::GameEnv;
 use banqi_core::core::env::{
     CurriculumEnv, DarkChessEnv,
@@ -145,12 +145,14 @@ fn run_scheduler(
                     task.task_id,
                     started.elapsed().as_secs_f64()
                 );
-                // 异步上报：序列化/gzip/sha256/R2 直传都在后台，主循环立刻进入下一批
+                // 异步上报：编码/gzip/sha256/R2 直传都在后台，主循环立刻进入下一批
                 registry.submit_episode_report(EpisodeBatch {
                     task_id: task.task_id.clone(),
                     network_sha: task.network_sha.clone(),
+                    variant: task.variant.clone(),
                     winner,
                     episodes: result.episodes,
+                    nnue_episodes: result.nnue_episodes,
                 });
             }
             TaskKind::TaskRating => {
