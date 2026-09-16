@@ -180,6 +180,16 @@ pub struct SelfPlayConfig {
     pub health_confidence_exp: f32,
     /// 是否在记录 Episode 时同步收集 NNUE 稀疏特征（供 NNUE 训练管道）
     pub collect_nnue_features: bool,
+    /// 走批量锁步路径的变体白名单（空 = 全部走单树路径，即历史行为）。
+    ///
+    /// 批量路径把多局树的叶子评估合并成一个大 batch 送推理（见 `self_play::batched`），
+    /// 收益来自「单次评估的算力利用率」，因此强烈依赖设备与网络规模：
+    ///   - GPU 推理 / 4x4 / 4x8：实测明显加速 → 建议 `["4x4", "4x8"]`；
+    ///   - CPU + 小网络（4x2）：锁步同步与等最慢树的固定开销大于收益 → 建议留空（走单树）。
+    /// 另注：批量路径要求 A/B 同一模型（selfplay 任务恒满足），且未接算力随机化（PCR）；
+    /// 批量生效时 `scheduler.sessions` 应相应减少（并发改由 batch 提供，会话池无需摊平，
+    /// 反而会让每会话 intra-op 线程变少）。
+    pub batched_variants: Vec<String>,
     /// 整局复用同一棵 MCTS 树：每步用 `step_next` 把根推进到实际走子的子节点。
     ///
     /// 收益：已积累的访问 / Q 直接参与下一步搜索（不必从零重搜），并省去每步的根评估推理。
@@ -209,6 +219,7 @@ impl Default for SelfPlayConfig {
             health_weight: 0.0,
             health_confidence_exp: 0.0,
             collect_nnue_features: false,
+            batched_variants: Vec::new(),
             tree_reuse: false,
             threads: 0,
         }
@@ -223,6 +234,11 @@ impl SelfPlayConfig {
         } else {
             self.fast_mcts_sims
         }
+    }
+
+    /// 该变体是否走批量锁步路径（`batched_variants` 白名单，变体标识用 `"4x8"` / `"4x4"` / `"4x2"`）。
+    pub fn batched_for(&self, variant: &str) -> bool {
+        self.batched_variants.iter().any(|v| v == variant)
     }
 }
 

@@ -59,6 +59,15 @@ fn main() -> Result<()> {
         pool.current_num_threads(),
         cfg.scheduler.sessions
     );
+    if !cfg.selfplay.batched_variants.is_empty() {
+        println!(
+            "批量锁步自对弈变体 = {:?}（并发 = 线程池大小 {}）；批量靠 batch 吃算力，\
+             建议把 sessions 调小（1~{}）以给每个会话更多 intra-op 线程",
+            cfg.selfplay.batched_variants,
+            pool.current_num_threads(),
+            batch_worker_hint(pool.current_num_threads())
+        );
+    }
     if let Some(path) = &args.overrides.config_dump {
         cfg.dump_to(path)?;
         println!("配置快照已写入: {}", path.display());
@@ -190,6 +199,12 @@ fn run_scheduler(
     Ok(())
 }
 
+/// 批量路径建议的会话数上限：与 `batched::run_batched_games` 的评估 worker 数同规则
+/// （`concurrency.min(8)`），使「在途批数 ≈ 会话数」，避免多余会话各自摊薄 intra-op 线程。
+fn batch_worker_hint(concurrency: usize) -> usize {
+    concurrency.min(8).max(1)
+}
+
 /// 自对弈线程池：`threads = 0` 取 CPU 核数。
 fn build_pool(threads: usize) -> Result<rayon::ThreadPool> {
     let threads = if threads > 0 { threads } else { num_cpus::get() };
@@ -219,10 +234,13 @@ fn run_variant_dispatch(
     record_episodes: bool,
     pool: &rayon::ThreadPool,
 ) -> Result<MatchResult> {
+    // 批量锁步路径仅用于记录模式（自对弈，双方同一模型）：rating 是异构对手且不产数据，
+    // 必须走单树路径。
+    let batched = record_episodes && config.batched_for(variant);
     match variant {
-        "4x8" => run_games::<DarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
-        "4x4" => run_games::<Game4x4Env>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
-        "4x2" => run_games::<MiniDarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, pool),
+        "4x8" => run_games::<DarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, batched, pool),
+        "4x4" => run_games::<Game4x4Env>(initial_revealed, model_a, model_b, config, n_games, record_episodes, batched, pool),
+        "4x2" => run_games::<MiniDarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, batched, pool),
         other => anyhow::bail!("未知变体: {other}（可选 4x8 / 4x4 / 4x2）"),
     }
 }
@@ -234,6 +252,7 @@ fn run_games<G>(
     config: &SelfPlayConfig,
     n_games: usize,
     record_episodes: bool,
+    batched: bool,
     pool: &rayon::ThreadPool,
 ) -> Result<MatchResult>
 where
@@ -262,6 +281,7 @@ where
         config,
         seed: None,
         record_episodes,
+        batched,
         model_sims: config.mcts_sims,
         thread_pool: Some(pool),
         make_env,

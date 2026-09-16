@@ -13,7 +13,7 @@
 - `src/config.rs`：分层配置 `CollectorConfig`（`[scheduler]` / `[selfplay]` 两段，并发旋钮归入各自消费方）：加载顺序为「默认值 → `--config <TOML>` → CLI 覆盖」，`--config-dump <PATH>` 回写生效快照；字段拼错 / 取值越界在启动时即报错，不会带进运行期。
 - `src/registry/scheduler_registry.rs`：`SchedulerRegistry` — gRPC 客户端（`Channel` 长连接，一次建连全程复用）+ reqwest 预签名下载/直传 + sha256 SRI 校验 + 30s 后台心跳；模型按 sha 进程内缓存（每个 sha 一个**会话池**，通道数由 `scheduler.sessions` 决定，A/B、rating 双方共用）。上报异步化：`submit_episode_report` / `submit_match_report` 立即返回，JSON 序列化 + gzip + sha256 + R2 直传都在后台 tokio 任务中完成，`report_slots` 信号量限制在途批数（背压 + 约束驻留内存）；心跳发现 best 变化时后台预取该网络。解析 `SelfPlayParams.extra_config`（JSON 透传）中的 `initial_revealed_pieces`，注入 `SchedulerTask.initial_revealed`。
 - `src/pipeline/self_play/match_core.rs`：`MatchParams.make_env` 为 `Arc<dyn Fn() -> G + Send + Sync>` 环境工厂（支持课程参数闭包注入）；`run_match_core` 其余语义不变。
-- `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `serialize`），已移除 PyO3（PyPredictor）分支；`serialize::episode_to_dict_json` 行格式与主仓库及 Python 侧契约一致。
+- `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `serialize` / `batched`），已移除 PyO3（PyPredictor）分支；`serialize::episode_to_dict_json` 行格式与主仓库及 Python 侧契约一致。`batched` 为可选的批量锁步路径（变体白名单 `SelfPlayConfig.batched_variants` 控制，见下）。
 - `proto/scheduler.proto`：与 banqi-scheduler 仓库副本同步维护（双侧同步，变更须同时更新）。
 
 ## 变更记录
@@ -33,6 +33,14 @@
 - 2026-09-15：同步 `banqi-core` 的 MCTS 评估契约变更（`Evaluator::evaluate` / `GumbelMCTS::run` 改为 `Result`）：`RandomEval` / `PlayerEval` 实现改为返回 `Result<EvaluatorOutput, EvaluatorError>`；`model_mcts_action` / `policy_argmax_action` / `play_one_game_recorded` / `SelfPlayRunner::play_episode` 在推理失败时**打印错误并令本局作废**（`episode: None` 或 `winner: None`），不再 panic、也不写入无效训练数据；bin 侧原有「record 模式下 0 局产出即 `bail!`」的判定会把失败暴露为批次错误。
 - 2026-09-16：自对弈录制路径新增可选的**整局树复用**（`SelfPlayConfig.tree_reuse`，默认 `false`）：`play_one_game_recorded` 在启用时整局持有同一棵 `GumbelMCTS`，每步以 `set_num_simulations` 调整预算、走子后 `step_next` 把根推进到实际到达的子节点，省去每步的根评估推理并复用已积累的访问 / Q。启用前提是双方为同一模型的自对弈（selfplay 任务恒满足；异构对手走非录制的评估路径）。已知代价：根访问计数随局内累积 → 改进策略 `sigma = c_scale·ln(1+N_root)` 增大、训练目标逐步向 Q 主导偏移（用 `train/policy_entropy` 观测）；arena 整局不释放，长局须实测 RSS。
 - 2026-09-16：评估 / rating 路径的搜索探索系数改为**与生成路径同口径**：`model_mcts_action` 的 `c_scale` 由硬编码 `0.25` 改为取自 `SelfPlayConfig.c_scale`（默认 `1.0`），经 `get_player_action` / `play_one_game` 透传。此前评估侧与产数据侧用了两套搜索口径（`c_scale` 同时作用于非根 PUCT 与训练目标 σ），A/B 与 gatekeeper 结论会失真。
+- 2026-09-16：新增**批量锁步自对弈路径**（`src/pipeline/self_play/batched.rs`，自 `rust_4x8` 同名模块移植；原仓库保留该实现）：
+  - **入口与开关**：`SelfPlayConfig.batched_variants`（变体白名单，默认空 = 全走单树路径）+ `SelfPlayConfig::batched_for(variant)`；`MatchParams.batched` 由调用方按白名单计算（bin 里额外要求 `record_episodes`，rating 恒走单树）；`run_match_core` 在 `batched && record_episodes` 时改走 `run_batched_games`，对局统计与 `MatchResult` 组装仍走同一条主干。
+  - **并发度**：取 `thread_pool.current_num_threads()`；主线程只做 MCTS 选择/回填，推理在 `concurrency.min(8)` 个后台 scoped 线程上进行（流水线）。
+  - **与单树路径的语义差异**：A/B 共用同一评估器（仅可用于双方同一模型的自对弈）；未接算力随机化（样本恒 `is_full_search = true`）。
+  - **失败语义**（banqi-core 的 `Evaluator::evaluate` 现可失败）：推理失败或返回残缺的批 → 标记涉及的局作废（不产出 episode、不计入胜负），避免「同一叶子反复重收集」的空转死循环。
+  - **实测**（`examples/selfplay_throughput --players random`，4x2/线程 4，随机评估器下 `gen_games_s`）：单树 161 局/s vs 批量 51 局/s —— 与「4x2 批量变慢」的观测一致；批量收益依赖设备与网络规模（GPU/大网络）。
+  - **新增 benchmark 开关**：`examples/selfplay_throughput --batched`（配合 `--variant` / `--device` / `--sessions` 跑「变体 × 设备」矩阵）。
+
 
 ## 入口
 
@@ -70,6 +78,12 @@ full_search_prob = 0.25
 tree_reuse = false        # 整局复用同一棵 MCTS 树（step_next 推进根）：省去每步根评估，
                           # 但根访问计数累积会放大改进策略的 sigma、且 arena 整局不释放，
                           # 启用前先按变体实测 RSS（4x2 树小，4x8 长局需谨慎）
+batched_variants = []     # 走批量锁步路径的变体白名单（空 = 全部单树路径）。多局树 lockstep
+                          # 把叶子评估合并成一个大 batch，收益来自「单次评估的算力利用率」：
+                          # GPU / 4x4 / 4x8 明显加速（建议 ["4x4","4x8"]），CPU + 小网络（4x2）
+                          # 反而变慢（锁步同步与等最慢树的固定开销）。仅记录模式生效（rating
+                          # 是异构对手，恒走单树）；启用时建议把 sessions 调小（≈ 批量评估
+                          # worker 数 = threads.min(8)），让每个会话分到更多 intra-op 线程。
 ```
 
 课程学习：调度器经 `extra_config` 下发 `initial_revealed_pieces` 时，bin 以 `banqi_core::core::env::CurriculumEnv::with_initial_revealed(n)` 构造每局环境（覆盖变体默认值，棋盘/动作空间/特征维度不变，网络跨阶段通用）；未下发时用变体默认配置。

@@ -67,7 +67,7 @@ pub enum PlayerSpec<G: GameEnv> {
 // ============================================================================
 
 /// 随机评估器：对所有合法动作给均匀先验。
-struct RandomEval;
+pub(crate) struct RandomEval;
 
 impl<G: GameEnv> Evaluator<G> for RandomEval {
     fn evaluate(&self, envs: &[G]) -> Result<EvaluatorOutput, EvaluatorError> {
@@ -91,7 +91,10 @@ impl<G: GameEnv> Evaluator<G> for RandomEval {
 }
 
 /// 具体（Sized）评估器包装：把 `PlayerSpec` 统一为可驱动 Gumbel MCTS 的评估器。
-enum PlayerEval<G: GameEnv + AsDarkChessRef> {
+///
+/// `pub(crate)`：批量锁步路径（`self_play::batched`）需要复用该类型作为后台推理线程
+/// 共享的评估器；两侧共用同一实例即要求双方为同一模型。
+pub(crate) enum PlayerEval<G: GameEnv + AsDarkChessRef> {
     Model(Arc<dyn Evaluator<G> + Send + Sync>),
     Random(RandomEval),
 }
@@ -584,7 +587,7 @@ where
 }
 
 /// 从 Episode 推导选手 A 视角结果与步数。
-fn outcome_from_episode(ep: GameEpisode, player_a_is_red: bool) -> GameOutcome {
+pub(crate) fn outcome_from_episode(ep: GameEpisode, player_a_is_red: bool) -> GameOutcome {
     let moves = ep.game_length;
     let r = match ep.winner {
         Some(1) => {
@@ -616,6 +619,11 @@ pub struct MatchParams<'a, G: GameEnv> {
     pub seed: Option<u64>,
     /// 是否记录完整 Episode（自对弈数据）；false 时仅收集胜负统计（评估）。
     pub record_episodes: bool,
+    /// 是否走批量锁步路径（`self_play::batched`）：多局树 lockstep 推进，叶子合并成
+    /// 一个大 batch 送推理。仅 `record_episodes=true` 且双方为同一模型时生效/可用；
+    /// 由调用方按变体白名单（`SelfPlayConfig::batched_for`）决定 —— 是否值得批量取决于
+    /// 设备与网络规模（GPU / 大网络受益，CPU + 小网络如 4x2 反而变慢）。
+    pub batched: bool,
     /// 模型选手的 MCTS 模拟数（评估路径）。
     pub model_sims: usize,
     /// 线程池：Some = 原生多线程（Rust 持模型 / 规则），None = 单线程。
@@ -672,9 +680,27 @@ where
         }
     };
 
-    let games: Vec<GameOutcome> = match params.thread_pool {
-        Some(pool) => pool.install(|| indices.into_par_iter().map(play).collect()),
-        None => indices.into_iter().map(play).collect(),
+    let games: Vec<GameOutcome> = if params.batched && params.record_episodes {
+        // 批量锁步路径：A/B 共用 player_a 的评估器（故要求双方同一模型，见 MatchParams.batched）。
+        // 并发度取线程池大小 —— 主线程只做 MCTS 选择/回填，推理在后台线程上进行。
+        let evaluator = make_evaluator(params.player_a);
+        let concurrency = params
+            .thread_pool
+            .map(|pool| pool.current_num_threads())
+            .unwrap_or(1);
+        super::batched::run_batched_games(
+            &evaluator,
+            params.config,
+            n,
+            concurrency,
+            params.seed,
+            &params.make_env,
+        )
+    } else {
+        match params.thread_pool {
+            Some(pool) => pool.install(|| indices.into_par_iter().map(play).collect()),
+            None => indices.into_iter().map(play).collect(),
+        }
     };
 
     let mut wins = 0;

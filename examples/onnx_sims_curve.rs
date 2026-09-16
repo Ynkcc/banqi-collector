@@ -241,6 +241,7 @@ fn main() -> Result<()> {
             config: &config,
             seed: args.seed,
             record_episodes: false,
+            batched: false, // 评估路径不产生 episode，批量（记录模式专用）不适用
             model_sims: sims,
             thread_pool: Some(&pool),
             make_env: make_env.clone(),

@@ -69,6 +69,10 @@ struct Args {
     /// 固定种子（缺省不固定）
     #[arg(long)]
     seed: Option<u64>,
+    /// 走批量锁步路径（多局树 lockstep、叶子合并成一个大 batch）：用于按「变体 × 设备」
+    /// 实测批量是否划算（4x4/4x8 + GPU 预期加速；4x2 / CPU 预期变慢）
+    #[arg(long, default_value_t = false)]
+    batched: bool,
 }
 
 fn build_config(args: &Args) -> SelfPlayConfig {
@@ -82,16 +86,19 @@ fn build_config(args: &Args) -> SelfPlayConfig {
         playout_cap_random_enabled: false,
         fast_mcts_sims: 0,
         full_search_prob: 0.25,
+        batched_variants: if args.batched { vec![args.variant.clone()] } else { Vec::new() },
         ..Default::default()
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_games<G>(
     model: &Option<Arc<OnnxModel>>,
     players: &str,
     config: &SelfPlayConfig,
     n_games: usize,
     seed: Option<u64>,
+    batched: bool,
     pool: &rayon::ThreadPool,
 ) -> banqi_collector::pipeline::self_play::MatchResult
 where
@@ -113,6 +120,7 @@ where
         config,
         seed,
         record_episodes: true,
+        batched,
         model_sims: config.mcts_sims,
         thread_pool: Some(pool),
         make_env: Arc::new(G::default),
@@ -138,9 +146,9 @@ fn dispatch(
     pool: &rayon::ThreadPool,
 ) -> Result<banqi_collector::pipeline::self_play::MatchResult> {
     let r = match args.variant.as_str() {
-        "4x8" => run_games::<DarkChessEnv>(model, &args.players, config, n_games, seed, pool),
-        "4x4" => run_games::<Game4x4Env>(model, &args.players, config, n_games, seed, pool),
-        "4x2" => run_games::<MiniDarkChessEnv>(model, &args.players, config, n_games, seed, pool),
+        "4x8" => run_games::<DarkChessEnv>(model, &args.players, config, n_games, seed, args.batched, pool),
+        "4x4" => run_games::<Game4x4Env>(model, &args.players, config, n_games, seed, args.batched, pool),
+        "4x2" => run_games::<MiniDarkChessEnv>(model, &args.players, config, n_games, seed, args.batched, pool),
         other => return Err(anyhow!("未知变体: {other}（可选 4x8 / 4x4 / 4x2）")),
     };
     if r.episodes.is_empty() {
@@ -175,7 +183,7 @@ fn main() -> Result<()> {
     let load_s = t_load.elapsed().as_secs_f64();
 
     println!(
-        "CONFIG variant={} sims={} mca={} games={} threads={} batches={} warmup={} device={} players={} sessions={sessions} record=true",
+        "CONFIG variant={} sims={} mca={} games={} threads={} batches={} warmup={} device={} players={} sessions={sessions} record=true batched={}",
         args.variant,
         config.mcts_sims,
         config.max_considered_actions,
@@ -185,6 +193,7 @@ fn main() -> Result<()> {
         args.warmup,
         args.device,
         args.players,
+        args.batched,
     );
     println!("METRIC stage=model_load elapsed_s={load_s:.4}");
 

@@ -1,4 +1,5 @@
 pub mod types;
+pub mod batched;
 pub mod finalize;
 pub mod match_core;
 pub mod serialize;
