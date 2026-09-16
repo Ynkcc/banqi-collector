@@ -14,12 +14,18 @@
 - `src/registry/scheduler_registry.rs`：`SchedulerRegistry` — gRPC 客户端（`Channel` 长连接，一次建连全程复用）+ reqwest 预签名下载/直传 + sha256 SRI 校验 + 30s 后台心跳；模型按 sha 进程内缓存（每个 sha 一个**会话池**，通道数由 `scheduler.sessions` 决定，A/B、rating 双方共用）。本地权重路径由服务端下发的对象键决定（`cache_dir/<network_key>`），加载器按对象键扩展名分派（`.onnx` → ONNX，其它格式在本构建下直接报错）。上报异步化：`submit_episode_report` / `submit_match_report` 立即返回，`EpisodeBatch` 二进制编码 + gzip + sha256 + R2 直传都在后台 tokio 任务中完成，`report_slots` 信号量限制在途批数（背压 + 约束驻留内存）；心跳发现 best 变化时后台预取该网络。解析 `SelfPlayParams.extra_config`（JSON 透传）中的 `initial_revealed_pieces`，注入 `SchedulerTask.initial_revealed`。
 - `src/pb.rs`：`scheduler.proto` 生成代码（gRPC 客户端 + 训练数据记录消息），唯一来源见 `proto/`。
 - `src/pipeline/self_play/match_core.rs`：`MatchParams.make_env` 为 `Arc<dyn Fn() -> G + Send + Sync>` 环境工厂（支持课程参数闭包注入）；`run_match_core` 其余语义不变。
-- `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `codec` / `batched`），已移除 PyO3（PyPredictor）分支。`codec` 是训练数据记录的唯一编码实现（`EpisodeBatch` 二进制，proto 契约；按数据类别只编码对应的一类记录），训练侧解码在 `banqi_training/episode_codec.py`。`batched` 为可选的批量锁步路径（变体白名单 `SelfPlayConfig.batched_variants` 控制，见下）。
+- `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `codec` / `batched`），已移除 PyO3（PyPredictor）分支。`codec` 是训练数据记录的唯一编码实现（`EpisodeBatch` 二进制，proto 契约；按数据类别只编码对应的一类记录），训练侧解码在 `banqi_training/episode_codec.py`。`batched` 为可选的批量锁步路径（变体白名单 `SelfPlayConfig.batched_variants` 控制，见下）。`reanalysis` 是跨进程局面重搜的执行端（输入训练侧下发的局面快照 → 用当前网络重跑 MCTS → 「一局面一 episode」走既有上报通道），其数据来源是 `SelfPlayConfig.collect_positions`（记录时把每步局面快照写入 `EpisodeRecord.positions`）。
 - 数据类别：`SchedulerTask.data_kind`（服务端下发）决定本任务产哪类记录；`DATA_RESNET` 走 Gumbel MCTS 记录路径（当前唯一支持的类别），`DATA_NNUE` 需 Expectimax 采集路径（未接入，收到即明确报错退出）。`PlayerSpec::Expectimax` 与 `NnueEpisode` 类型已就位但 bin 尚未构造该选手。
 - `proto/scheduler.proto`：与 banqi-scheduler 仓库副本同步维护（双侧同步，变更须同时更新）。
 
 ## 变更记录
 
+- 2026-09-16：**局面快照与跨进程重搜（reanalysis）执行端（N9 阶段 2）**：
+  - **快照契约**：`banqi-core` 新增 `env/snapshot.rs`（`PositionSnapshot` + `SnapshotEnv` trait，手写紧凑字节编解码，版本号 + 全边界检查）；本仓库用 `collect_positions` 在记录时把每步 `PositionSnapshot::encode()` 写入 `GameEpisode.positions`（单树路径与批量路径都收集，推入点与样本严格同点，`finalize_episode` 再做长度校验、不齐即丢侧信道并告警）。
+  - **线格式**：`EpisodeRecord` 新增 `repeated bytes positions = 22`（空 = 未收集）；`codec::encode_episode` 校验「快照数 == 样本数」后才编码（不对齐即整批报错）；训练端 `episode_codec.py` 解码为等长 bytes 列表或 `None`（新增 `tests/test_episode_codec.py` 契约测试）。三份 proto 副本（banqi-collector / banqi-scheduler / banqi-training）已同步，Python pb2 已按 `proto/__init__.py` 记录的配方重新生成。
+  - **执行端**：新增 `src/pipeline/self_play/reanalysis.rs`：`run_reanalysis(items, evaluator, config, pool, tag)` 逐项 decode → `G::from_snapshot`（变体不符即拒绝）→ 单棵树 Gumbel MCTS → **一局面一 episode**（1 样本，标记 `is_full_search=true`）。`policy/mcts_value/completed_q` 取本次重搜产出，`game_result/health_diff` **沿用载荷携带的原局真值** —— 因此训练端 `VALUE_TARGET_MODE` 的任何取值都无需为这批数据做特殊处理。
+  - **失败语义**：载荷非法 / 推理失败计入 `failed`（最多打印 5 条原因）；局面已终局（无合法动作）计入 `skipped`；两者都不产出数据，不 panic、不静默。
+- 2026-09-16：**训练数据记录改为 schema 化二进制（弃用逐字段 JSON）**，同时修掉网络权重「格式靠约定」的问题：
 - 2026-09-16：**训练数据记录改为 schema 化二进制（弃用逐字段 JSON）**，同时修掉网络权重「格式靠约定」的问题：
   - **契约来源**：`scheduler.proto` 新增 `EpisodeBatch` / `EpisodeRecord` / `NnueEpisodeRecord` / `NnueFeatures` / `NnueMeta`，字段号 + `schema_version` 是训练数据的唯一契约（原先是「字段名约定」，由 `serialize.rs` 注释保证）。
   - **编码实现**：`src/pipeline/self_play/serialize.rs` 删除，代之以 `codec.rs`：棋盘位平面（`[步][通道][位置字节]`，MSB 优先，每步 2KB → 64B @4x8）与动作掩码位图（每步 1.4KB → 44B）位打包，标量/策略等张量走稠密小端缓冲区（训练端 `np.frombuffer` 零拷贝）；NNUE 稀疏特征用「索引拼接 + 前缀和偏移」编码。对象键 `episodes/<sha>/<id>.epb.gz`。
@@ -85,6 +91,8 @@ threads = 12              # 自对弈线程数，0 = CPU 核数
 mcts_sims = 64
 max_considered_actions = 16
 scenario = "standard"
+collect_positions = false # 记录每步局面快照（EpisodeRecord.positions，约 135B/步）：
+                          # 跨进程 reanalysis 的数据来源；不跑重搜时保持 false 以免白付体积
 playout_cap_random_enabled = false
 fast_mcts_sims = 0        # 0 = mcts_sims / 4
 full_search_prob = 0.25

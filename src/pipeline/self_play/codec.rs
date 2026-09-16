@@ -170,6 +170,13 @@ fn encode_episode(ep: &GameEpisode) -> Result<Option<EpisodeRecord>> {
         is_full_search.push(u8::from(*is_full));
     }
 
+    // ---- 局面快照（reanalysis 侧信道）：与样本严格对齐，不符即契约破裂 ----
+    let positions_field = match &ep.positions {
+        None => Vec::new(),
+        Some(p) if p.len() == steps => p.clone(),
+        Some(p) => bail!("局面快照数 {} 与样本数 {steps} 不一致", p.len()),
+    };
+
     Ok(Some(EpisodeRecord {
         steps: u32_of(steps, "样本步数")?,
         board_channels: u32_of(board_channels, "棋盘通道数")?,
@@ -191,6 +198,7 @@ fn encode_episode(ep: &GameEpisode) -> Result<Option<EpisodeRecord>> {
         game_length: u32_of(ep.game_length, "对局步数")?,
         winner: ep.winner,
         health_diff_red: ep.health_diff_red,
+        positions: positions_field,
     }))
 }
 
@@ -400,6 +408,7 @@ mod tests {
             game_length: 2,
             winner: Some(1),
             health_diff_red: Some(0.3),
+            positions: None,
         }
     }
 
@@ -435,6 +444,23 @@ mod tests {
     }
 
 
+
+    /// 局面快照（reanalysis 侧信道）必须原样过线；与样本数不对齐即失败。
+    #[test]
+    fn positions_roundtrip_and_misalignment_rejected() {
+        let mut ep = sample_episode();
+        ep.positions = Some(vec![vec![1u8, 2, 3], vec![4u8, 5]]);
+        let raw = encode_episode_batch("4x4", DataKind::DataResnet, std::slice::from_ref(&ep), &[])
+            .expect("编码失败");
+        let batch = EpisodeBatch::decode(raw.as_slice()).expect("解码失败");
+        assert_eq!(batch.episodes[0].positions, vec![vec![1u8, 2, 3], vec![4u8, 5]]);
+
+        // 2 步样本只给 1 个快照 → 契约破裂，宁可丢一批
+        let mut bad = sample_episode();
+        bad.positions = Some(vec![vec![0u8]]);
+        let err = encode_episode_batch("4x4", DataKind::DataResnet, &[bad], &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("局面快照数"), "实际错误: {err:#}");
+    }
 
     #[test]
     fn reject_non_binary_board() {

@@ -250,6 +250,10 @@ message EpisodeRecord {
   optional float health_diff_red = 20;  // 红方视角的终局血量差
   reserved 21;                 // 曾用于「MCTS 记录内嵌 NNUE 稀疏特征」，已废弃：
                                // NNUE 特征只由 NnueEpisodeRecord 承载，两类数据彻底分家
+  // steps 个局面快照（每个 = banqi_core::core::env::PositionSnapshot::encode 的字节串，
+  // 约 135 字节/步）。空 = 本批未收集（collect_positions=false）。用途：训练侧保留历史
+  // 局面，稍后用更强的网络重跑 MCTS 刷新策略/价值目标（跨进程 reanalysis）。
+  repeated bytes positions = 22;
 }
 
 // NNUE 特征布局元信息（由 env.config 推导，训练端免硬编码还原维度）。

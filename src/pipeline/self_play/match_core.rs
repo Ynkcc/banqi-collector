@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use banqi_core::core::env::GameEnv;
+use banqi_core::core::env::{GameEnv, SnapshotEnv};
 use banqi_core::core::expectimax::ExpectimaxEngine;
 use banqi_core::core::mcts::{
     Evaluator, EvaluatorError, EvaluatorOutput, GumbelConfig, GumbelMCTS,
@@ -441,6 +441,12 @@ where
     };
 
     let mut episode_data = Vec::new();
+    // 局面快照侧信道（reanalysis 数据来源）：与 episode_data 同步推入，保证严格对齐
+    let mut positions: Option<Vec<Vec<u8>>> = if config.collect_positions {
+        Some(Vec::new())
+    } else {
+        None
+    };
     let mut step = 0;
 
     let eval_a = make_evaluator(player_a_spec);
@@ -474,6 +480,11 @@ where
             config.fast_sims()
         };
 
+        // 落子前的局面快照（position 索引与本次 push 的样本一致）
+        if let Some(buf) = positions.as_mut() {
+            buf.push(env.as_darkchess_ref().to_snapshot().encode());
+        }
+
         let run_result = if let Some(mcts) = reused_mcts.as_mut() {
             mcts.set_num_simulations(step_sims);
             mcts.run()
@@ -487,7 +498,7 @@ where
             Ok(Some(r)) => r,
             Ok(None) => {
                 let (_, _, winner) = env.check_game_over_conditions();
-                let ep = finalize_episode(episode_data, winner, env.terminal_health_diff_red());
+                let ep = finalize_episode(episode_data, winner, env.terminal_health_diff_red(), positions);
                 return outcome_from_episode(ep, player_a_is_red);
             }
             Err(e) => {
@@ -520,7 +531,7 @@ where
         match env.step(action) {
             Ok((_, terminated, truncated, winner)) => {
                 if terminated || truncated {
-                    let ep = finalize_episode(episode_data, winner, env.terminal_health_diff_red());
+                    let ep = finalize_episode(episode_data, winner, env.terminal_health_diff_red(), positions);
                     return outcome_from_episode(ep, player_a_is_red);
                 }
                 // 局面已推进：把根移到实际走子对应的子节点（终局路径无需推进，直接返回）
@@ -535,6 +546,7 @@ where
                     game_length: step,
                     winner: None,
                     health_diff_red: env.terminal_health_diff_red(),
+                    positions: None,
                 };
                 return outcome_from_episode(ep, player_a_is_red);
             }
@@ -542,7 +554,7 @@ where
 
         step += 1;
         if step >= env.max_steps() {
-            let ep = finalize_episode(episode_data, Some(0), env.terminal_health_diff_red());
+            let ep = finalize_episode(episode_data, Some(0), env.terminal_health_diff_red(), positions);
             return outcome_from_episode(ep, player_a_is_red);
         }
     }

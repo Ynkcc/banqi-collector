@@ -3,6 +3,7 @@ pub mod batched;
 pub mod codec;
 pub mod finalize;
 pub mod match_core;
+pub mod reanalysis;
 
 pub use types::{
     GameEpisode, GameStats, NnueEpisode, NnueEpisodeMeta, NnueStepFeatures, ScenarioType,
@@ -13,3 +14,4 @@ pub use match_core::{
     AsDarkChessRef, MatchParams, MatchResult, PlayerSpec, SeedableEnv, run_match_core,
 };
 pub use codec::{SCHEMA_VERSION, encode_episode_batch};
+pub use reanalysis::{ReanalysisItem, ReanalysisReport, run_reanalysis};

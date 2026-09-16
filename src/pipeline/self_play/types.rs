@@ -94,6 +94,13 @@ pub struct GameEpisode {
     pub winner: Option<i32>,
     /// 终局归一化血量差（红方视角为正）：(红HP-黑HP)/(初始总HP+最大子力分值)，大致落在 [-1,1]。
     pub health_diff_red: Option<f32>,
+    /// 每步局面的快照字节串（`banqi_core::core::env::PositionSnapshot::encode`）：
+    /// `collect_positions=true` 时收集，与 `samples` 严格对齐；None = 未收集。
+    ///
+    /// 用途：跨进程「局面重搜（reanalysis）」 —— 训练侧据此保留一批历史局面，
+    /// 稍后用更强的网络重跑 MCTS 刷新策略/价值目标。体积约 135 字节/步（4x8 满袋）。
+    #[serde(default)]
+    pub positions: Option<Vec<Vec<u8>>>,
 }
 
 // ================ 场景定义 ================
@@ -174,6 +181,12 @@ pub struct SelfPlayConfig {
     pub health_weight: f32,
     /// λ 随 |v_win| 的自适应幂指数（0 = 常量 λ）
     pub health_confidence_exp: f32,
+    /// 是否在记录 Episode 时同步收集每步的**局面快照**（跨进程「局面重搜 reanalysis」的数据来源）。
+    ///
+    /// 开启后 `GameEpisode.positions` 携带每步约 135 字节的快照（4x8 满袋），episode 体积与
+    /// 序列化/上报成本相应上升，单树路径与批量路径都会收集。是否下发/执行重搜任务另由
+    /// 调度器与 `REANALYSIS_*` 类开关控制，二者独立。默认关闭：不跑 reanalysis 不必付这份成本。
+    pub collect_positions: bool,
     /// 走批量锁步路径的变体白名单（空 = 全部走单树路径，即历史行为）。
     ///
     /// 批量路径把多局树的叶子评估合并成一个大 batch 送推理（见 `self_play::batched`），
@@ -212,6 +225,7 @@ impl Default for SelfPlayConfig {
             health_enabled: false,
             health_weight: 0.0,
             health_confidence_exp: 0.0,
+            collect_positions: false,
             batched_variants: Vec::new(),
             tree_reuse: false,
             threads: 0,
@@ -330,6 +344,7 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                         episode_data,
                         winner,
                         env.terminal_health_diff_red(),
+                        None,
                     );
                 }
                 Err(e) => {
@@ -339,6 +354,7 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                         episode_data,
                         None,
                         env.terminal_health_diff_red(),
+                        None,
                     );
                 }
             };
@@ -376,6 +392,7 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                             episode_data,
                             winner,
                             env.terminal_health_diff_red(),
+                            None,
                         );
                     }
                 }
@@ -386,6 +403,7 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                         game_length: step,
                         winner: None,
                         health_diff_red: env.terminal_health_diff_red(),
+                        positions: None,
                     };
                 }
             }
@@ -399,6 +417,7 @@ impl<'a, G: GameEnv, E: Evaluator<G>> SelfPlayRunner<'a, G, E> {
                     episode_data,
                     Some(0),
                     env.terminal_health_diff_red(),
+                    None,
                 );
             }
         }

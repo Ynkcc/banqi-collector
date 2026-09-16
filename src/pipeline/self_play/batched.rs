@@ -29,6 +29,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+use banqi_core::core::env::SnapshotEnv;
 use banqi_core::core::env::seed::SeedableEnv;
 use banqi_core::core::env::{GameEnv, Player, ResNetObservation};
 use banqi_core::core::mcts::{
@@ -37,7 +38,7 @@ use banqi_core::core::mcts::{
 
 use super::SelfPlayConfig;
 use super::finalize_episode;
-use super::match_core::{GameOutcome, outcome_from_episode};
+use super::match_core::{AsDarkChessRef, GameOutcome, outcome_from_episode};
 
 /// 单局样本元组，与 `GameEpisode.samples` 的元素类型一致。
 type SampleTuple = (
@@ -155,7 +156,7 @@ pub(crate) fn run_batched_games<G, E>(
     make_env: &Arc<dyn Fn() -> G + Send + Sync>,
 ) -> Vec<GameOutcome>
 where
-    G: GameEnv + SeedableEnv,
+    G: GameEnv + SeedableEnv + AsDarkChessRef,
     E: Evaluator<G> + Sync,
 {
     let concurrency = concurrency.max(1);
@@ -199,6 +200,9 @@ where
             // 初始化本波的游戏树 + 每局的样本收集
             let mut trees: Vec<BatchedTree<'_, G, E>> = Vec::with_capacity(wave);
             let mut episode_data: Vec<Vec<SampleTuple>> = Vec::with_capacity(wave);
+            // 局面快照侧信道（reanalysis 数据来源）：与各局 episode_data 同步推入
+            let collect_positions = config.collect_positions;
+            let mut positions_data: Vec<Vec<Vec<u8>>> = Vec::with_capacity(wave);
             for i in 0..wave {
                 let mut env = (make_env)();
                 if let Some(s) = seed {
@@ -206,6 +210,7 @@ where
                 }
                 trees.push(BatchedTree::new(&env, evaluator, &gumbel_cfg));
                 episode_data.push(Vec::new());
+                positions_data.push(Vec::new());
             }
             let mut active: Vec<bool> = vec![true; wave];
             // 推理失败作废的局：不产出 episode，也不参与胜/和/负统计
@@ -223,7 +228,19 @@ where
                     if !active[i] || blocked[i].is_some() {
                         continue;
                     }
+                    // 落子前的局面快照（须与本次推入的样本严格对齐，故先取再判 finalize_step）
+                    let pre_step = if collect_positions {
+                        trees[i]
+                            .tree
+                            .root_env()
+                            .map(|e| e.as_darkchess_ref().to_snapshot().encode())
+                    } else {
+                        None
+                    };
                     if trees[i].finalize_step() {
+                        if let Some(p) = pre_step {
+                            positions_data[i].push(p);
+                        }
                         if let Some(r) = &trees[i].result {
                             episode_data[i].push((
                                 r.state.clone(),
@@ -320,6 +337,11 @@ where
                     std::mem::take(&mut episode_data[i]),
                     winner,
                     health_diff_red,
+                    if collect_positions {
+                        Some(std::mem::take(&mut positions_data[i]))
+                    } else {
+                        None
+                    },
                 );
                 games.push(outcome_from_episode(ep, player_a_is_red));
             }
