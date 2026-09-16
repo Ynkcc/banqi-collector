@@ -31,6 +31,8 @@
   - **序列化上报副作用**：主循环日志中的「耗时」自此只含计算段，不再包含上传。
   - **`SelfPlayConfig`** 接入 serde 并收敛默认值：`playout_cap_random_enabled` 默认改为 `false`（与生产一致，此前 `Default` 为 `true` 会让 `onnx_sims_curve` 的胜率曲线被算力随机化污染）；`fast_mcts_sims = 0` 表示按 `mcts_sims / 4` 推导，新增 `SelfPlayConfig::fast_sims()` 统一读取点；`ScenarioType` 增加 serde（snake_case 字面量 `standard` 等）。
 - 2026-09-15：同步 `banqi-core` 的 MCTS 评估契约变更（`Evaluator::evaluate` / `GumbelMCTS::run` 改为 `Result`）：`RandomEval` / `PlayerEval` 实现改为返回 `Result<EvaluatorOutput, EvaluatorError>`；`model_mcts_action` / `policy_argmax_action` / `play_one_game_recorded` / `SelfPlayRunner::play_episode` 在推理失败时**打印错误并令本局作废**（`episode: None` 或 `winner: None`），不再 panic、也不写入无效训练数据；bin 侧原有「record 模式下 0 局产出即 `bail!`」的判定会把失败暴露为批次错误。
+- 2026-09-16：自对弈录制路径新增可选的**整局树复用**（`SelfPlayConfig.tree_reuse`，默认 `false`）：`play_one_game_recorded` 在启用时整局持有同一棵 `GumbelMCTS`，每步以 `set_num_simulations` 调整预算、走子后 `step_next` 把根推进到实际到达的子节点，省去每步的根评估推理并复用已积累的访问 / Q。启用前提是双方为同一模型的自对弈（selfplay 任务恒满足；异构对手走非录制的评估路径）。已知代价：根访问计数随局内累积 → 改进策略 `sigma = c_scale·ln(1+N_root)` 增大、训练目标逐步向 Q 主导偏移（用 `train/policy_entropy` 观测）；arena 整局不释放，长局须实测 RSS。
+- 2026-09-16：评估 / rating 路径的搜索探索系数改为**与生成路径同口径**：`model_mcts_action` 的 `c_scale` 由硬编码 `0.25` 改为取自 `SelfPlayConfig.c_scale`（默认 `1.0`），经 `get_player_action` / `play_one_game` 透传。此前评估侧与产数据侧用了两套搜索口径（`c_scale` 同时作用于非根 PUCT 与训练目标 σ），A/B 与 gatekeeper 结论会失真。
 
 ## 入口
 
@@ -65,6 +67,9 @@ scenario = "standard"
 playout_cap_random_enabled = false
 fast_mcts_sims = 0        # 0 = mcts_sims / 4
 full_search_prob = 0.25
+tree_reuse = false        # 整局复用同一棵 MCTS 树（step_next 推进根）：省去每步根评估，
+                          # 但根访问计数累积会放大改进策略的 sigma、且 arena 整局不释放，
+                          # 启用前先按变体实测 RSS（4x2 树小，4x8 长局需谨慎）
 ```
 
 课程学习：调度器经 `extra_config` 下发 `initial_revealed_pieces` 时，bin 以 `banqi_core::core::env::CurriculumEnv::with_initial_revealed(n)` 构造每局环境（覆盖变体默认值，棋盘/动作空间/特征维度不变，网络跨阶段通用）；未下发时用变体默认配置。

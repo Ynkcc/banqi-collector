@@ -180,6 +180,16 @@ pub struct SelfPlayConfig {
     pub health_confidence_exp: f32,
     /// 是否在记录 Episode 时同步收集 NNUE 稀疏特征（供 NNUE 训练管道）
     pub collect_nnue_features: bool,
+    /// 整局复用同一棵 MCTS 树：每步用 `step_next` 把根推进到实际走子的子节点。
+    ///
+    /// 收益：已积累的访问 / Q 直接参与下一步搜索（不必从零重搜），并省去每步的根评估推理。
+    /// 代价：
+    ///   1. 根节点访问计数随局内累积，而改进策略 sigma = c_scale·ln(1+N_root) 随之增大，
+    ///      训练目标会逐步向 Q 主导的锐化分布偏移（用 train/policy_entropy 观测）；
+    ///   2. arena 整局不释放，内存随对局步数线性增长（4x8 长局须实测 RSS）。
+    /// 默认关闭。启用前提是双方为同一模型的自对弈（collector 的 selfplay 任务恒满足；
+    /// 异构对手走非记录的评估路径，不经过此处）。
+    pub tree_reuse: bool,
     /// 自对弈线程数（0 = CPU 核数）；只被采集进程用于建 rayon 线程池
     pub threads: usize,
 }
@@ -199,6 +209,7 @@ impl Default for SelfPlayConfig {
             health_weight: 0.0,
             health_confidence_exp: 0.0,
             collect_nnue_features: false,
+            tree_reuse: false,
             threads: 0,
         }
     }

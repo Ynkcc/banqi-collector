@@ -466,6 +466,14 @@ where
     let eval_a = make_evaluator(player_a_spec);
     let eval_b = make_evaluator(player_b_spec);
 
+    // 树复用（SelfPlayConfig.tree_reuse）：整局持有同一棵搜索树，每步 step_next
+    // 把根推进到实际走子的子节点。仅同一模型自对弈可启用（见字段注释），故固定用 eval_a。
+    let mut reused_mcts = if config.tree_reuse {
+        Some(GumbelMCTS::new(&env, &eval_a, gumbel_cfg.clone()))
+    } else {
+        None
+    };
+
     loop {
         let cur = env.get_current_player().val();
         let is_a_turn = (cur == 1) == player_a_is_red;
@@ -486,11 +494,16 @@ where
             config.fast_sims()
         };
 
-        let mut step_gumbel_cfg = gumbel_cfg.clone();
-        step_gumbel_cfg.num_simulations = step_sims;
-
-        let mut mcts = GumbelMCTS::new(&env, evaluator, step_gumbel_cfg);
-        let search_result = match mcts.run() {
+        let run_result = if let Some(mcts) = reused_mcts.as_mut() {
+            mcts.set_num_simulations(step_sims);
+            mcts.run()
+        } else {
+            let mut step_gumbel_cfg = gumbel_cfg.clone();
+            step_gumbel_cfg.num_simulations = step_sims;
+            let mut mcts = GumbelMCTS::new(&env, evaluator, step_gumbel_cfg);
+            mcts.run()
+        };
+        let search_result = match run_result {
             Ok(Some(r)) => r,
             Ok(None) => {
                 let (_, _, winner) = env.check_game_over_conditions();
@@ -543,6 +556,10 @@ where
                 if terminated || truncated {
                     let ep = finalize_episode(episode_data, winner, env.terminal_health_diff_red(), nnue_meta_and_features(env.as_darkchess_ref(), nnue_features));
                     return outcome_from_episode(ep, player_a_is_red);
+                }
+                // 局面已推进：把根移到实际走子对应的子节点（终局路径无需推进，直接返回）
+                if let Some(mcts) = reused_mcts.as_mut() {
+                    mcts.step_next(&env, action);
                 }
             }
             Err(e) => {
