@@ -123,6 +123,8 @@ where
         record_episodes: true,
         batched,
         model_sims: config.mcts_sims,
+        // 吞吐基准双方同网、同模拟数（None = 与 model_sims 相同）
+        opponent_sims: None,
         thread_pool: Some(pool),
         make_env: Arc::new(G::default),
     })

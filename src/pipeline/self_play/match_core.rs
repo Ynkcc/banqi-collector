@@ -5,7 +5,7 @@
 // 移除 PyO3（PyPredictor）分支——本 crate 仅服务分布式训练采集链路。
 //
 // 设计要点：
-// - `PlayerSpec`：统一选手抽象（模型 / Expectimax / 随机）。
+// - `PlayerSpec`：统一选手抽象（模型 / Expectimax / 纯策略 / 规则策略 / 随机）。
 // - `run_match_core`：统一主干，支持固定 Seed、记录 Episode 或仅收集胜负统计。
 // - `AsDarkChessRef` / `SeedableEnv` 从 banqi-core 重导出，供规则选手
 //   取底层棋盘与设置种子。
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use banqi_core::core::env::{GameEnv, SnapshotEnv};
+use banqi_core::core::env::{DarkChessEnv, GameEnv, SnapshotEnv};
 use banqi_core::core::expectimax::ExpectimaxEngine;
 use banqi_core::core::mcts::{
     Evaluator, EvaluatorError, EvaluatorOutput, GumbelConfig, GumbelMCTS,
@@ -30,10 +30,24 @@ use super::{finalize_episode, GameEpisode, SelfPlayConfig};
 pub use banqi_core::core::env::seed::{AsDarkChessRef, SeedableEnv};
 
 // ============================================================================
+// 规则策略（无搜索的启发式走子）
+// ============================================================================
+
+/// 规则策略：直接对 `&DarkChessEnv` 决策，不做任何搜索。
+///
+/// 具体策略实现（优先吃子 / 优先翻棋等）由调用方注入——见 `rule_opponents`，
+/// 该模块在 `onnx` feature 下复用 banqi-engine 的实现。`match_core` 只认识本
+/// trait、不 `use banqi_engine`：banqi-engine 在 banqi-collector 中是 optional
+/// 依赖，直接引用会让本库在无 feature 时无法编译。
+pub trait RulePolicy: Send + Sync {
+    fn choose_action(&self, env: &DarkChessEnv) -> Option<usize>;
+}
+
+// ============================================================================
 // 统一选手抽象 PlayerSpec
 // ============================================================================
 
-/// 统一选手抽象：支持模型 / Expectimax+NNUE / 随机任意组合。
+/// 统一选手抽象：支持模型 / Expectimax+NNUE / 纯策略 / 规则策略 / 随机任意组合。
 pub enum PlayerSpec<G: GameEnv> {
     /// Expectimax + NNUE 引擎（独立 DFS 决策，不经 Gumbel MCTS）。
     Expectimax(Arc<ExpectimaxEngine>),
@@ -41,6 +55,9 @@ pub enum PlayerSpec<G: GameEnv> {
     ModelEval(Arc<dyn Evaluator<G> + Send + Sync>),
     /// 纯策略：直接取 policy head 在合法动作上的 argmax，不做任何搜索。
     PolicyArgmax(Arc<dyn Evaluator<G> + Send + Sync>),
+    /// 规则策略对手（优先吃子 / 优先翻棋等）：无搜索，仅用于绝对强度评估门禁。
+    /// 不参与记录（自对弈）路径 —— 见 `play_one_game_recorded` 的守卫。
+    Rule(Arc<dyn RulePolicy>),
     Random,
 }
 
@@ -101,6 +118,9 @@ where
         PlayerSpec::Random => PlayerEval::Random(RandomEval),
         PlayerSpec::Expectimax(_) => {
             unreachable!("Expectimax 选手不经 make_evaluator / MCTS 路径（应在调用处分流）")
+        }
+        PlayerSpec::Rule(_) => {
+            unreachable!("规则策略选手不经 make_evaluator / MCTS 路径（应在调用处分流）")
         }
     }
 }
@@ -199,6 +219,7 @@ where
             model_mcts_action(env, &PlayerEval::Model(e.clone()), model_sims, model_c_scale)
         }
         PlayerSpec::PolicyArgmax(e) => policy_argmax_action(env, e),
+        PlayerSpec::Rule(p) => p.choose_action(env.as_darkchess_ref()),
         PlayerSpec::Random => random_action(env),
     }
 }
@@ -423,6 +444,12 @@ where
     }
     if matches!(player_a_spec, PlayerSpec::Expectimax(_)) || matches!(player_b_spec, PlayerSpec::Expectimax(_)) {
         eprintln!("❌ 记录（自对弈）路径仅支持 Expectimax vs Expectimax 或双方均非 Expectimax 的组合");
+        return GameOutcome { result: 0, moves: 0, episode: None, nnue_episode: None };
+    }
+    // 规则策略没有评估器（不做搜索、不产 improved_policy / completed_q），放行会在
+    // make_evaluator 撞上 unreachable!；这里显式拒绝，避免把评估用选手接进数据生成路径。
+    if matches!(player_a_spec, PlayerSpec::Rule(_)) || matches!(player_b_spec, PlayerSpec::Rule(_)) {
+        eprintln!("❌ 记录（自对弈）路径不支持规则策略选手（规则策略仅用于评估）");
         return GameOutcome { result: 0, moves: 0, episode: None, nnue_episode: None };
     }
 

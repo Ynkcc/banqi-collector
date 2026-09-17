@@ -1,7 +1,7 @@
 // src/bin/collector.rs — 分布式采集进程（banqi-collector，仅 scheduler backend）
 //
 // 自 rust_4x8/src/bin/collector.rs 迁入（banqi-collector 拆分），仅保留分布式形态：
-// SchedulerRegistry（gRPC GetTask + R2 预签名直传；selfplay / rating / reanalysis 三类任务）。
+// SchedulerRegistry（gRPC GetTask + R2 预签名直传；selfplay / rating / eval / reanalysis 四类任务）。
 // 本地采集（LocalRegistry/LocalEpisodeStore）留在 rust_4x8 主仓库。
 //
 // 配置：分层加载（默认值 → TOML → CLI 覆盖）见 src/config.rs；--config-dump 可落盘快照。
@@ -17,7 +17,8 @@ use rayon::ThreadPoolBuilder;
 use banqi_collector::config::{CliOverrides, CollectorConfig};
 use banqi_collector::pipeline::self_play::{
     AsDarkChessRef, GameEpisode, MatchParams, MatchResult, PlayerSpec, ReanalysisReport,
-    SeedableEnv, SelfPlayConfig, decode_payload, run_match_core, run_reanalysis,
+    RuleOpponent, SeedableEnv, SelfPlayConfig, decode_payload, eval_opponent_spec, run_match_core,
+    run_reanalysis,
 };
 use banqi_collector::registry::{
     CLIENT_VERSION, EpisodeBatch, MatchReport, SchedulerRegistry,
@@ -105,7 +106,10 @@ fn run_scheduler(
             }
         };
 
-        // 服务端下发覆盖本地值（0 = 不覆盖）；fast_mcts_sims 归零即按新值重新推导
+        // 服务端下发覆盖本地值（0 = 不覆盖）；fast_mcts_sims 归零即按新值重新推导。
+        // 注意：eval 任务同样走这里——下发 >0 即作为该次评估的搜索深度；下发 0 表示
+        // 纯策略（无搜索），此时不覆盖本地值，由 TaskEval 分支按 `task.mcts_sims == 0`
+        // 选用 PolicyArgmax，不使用 selfplay.mcts_sims。
         if task.mcts_sims > 0 {
             selfplay.mcts_sims = task.mcts_sims;
             selfplay.fast_mcts_sims = 0;
@@ -121,7 +125,8 @@ fn run_scheduler(
                     &task.variant,
                     task.initial_revealed,
                     Arc::clone(&model),
-                    model,
+                    NetworkMode::Mcts,
+                    Opponent::Model(model),
                     &selfplay,
                     task.games,
                     true,
@@ -165,7 +170,8 @@ fn run_scheduler(
                     &task.variant,
                     task.initial_revealed,
                     candidate,
-                    opponent,
+                    NetworkMode::Mcts,
+                    Opponent::Model(opponent),
                     &selfplay,
                     n,
                     false,
@@ -183,13 +189,72 @@ fn run_scheduler(
                 registry.add_completed_games(n);
                 registry.submit_match_report(MatchReport {
                     task_id: task.task_id.clone(),
+                    kind: TaskKind::TaskRating,
                     network_sha: task.network_sha.clone(),
                     opponent_sha: task.opponent_sha.clone(),
+                    opponent_spec: String::new(),
                     games: n,
                     wins: result.wins,
                     losses: result.losses,
                     draws: result.draws,
                     pairs,
+                    avg_moves: 0.0,
+                });
+            }
+            TaskKind::TaskEval => {
+                // 绝对强度评估：被测网络 vs 规则/内建对手，只统计胜负并落库（不参与晋级）。
+                // 搜索深度由服务端下发：task.mcts_sims == 0 → 纯策略 argmax（门禁主口径）。
+                let candidate = registry.model(&task.network_sha)?;
+                let opponent = match task.opponent_spec.as_str() {
+                    "" => Opponent::Model(registry.model(&task.opponent_sha)?),
+                    "random" => Opponent::Random,
+                    spec => match RuleOpponent::parse(spec) {
+                        Some(kind) => Opponent::Rule(kind),
+                        // get_task 已校验过标识，这里只是兜底（不静默退化到别的对手）
+                        None => anyhow::bail!("未知评估对手标识: {spec}"),
+                    },
+                };
+                let mode = if task.mcts_sims == 0 {
+                    NetworkMode::PolicyArgmax
+                } else {
+                    NetworkMode::Mcts
+                };
+                let n = task.games.max(1);
+                let result = run_variant_dispatch(
+                    &task.variant,
+                    task.initial_revealed,
+                    candidate,
+                    mode,
+                    opponent,
+                    &selfplay,
+                    n,
+                    false,
+                    pool,
+                )?;
+                let avg = result.avg_moves;
+                println!(
+                    "[iter {iteration}] eval task={} opponent={} mode={:?} games={n} w/l/d={}/{}/{} 步均 {avg:.1} 计算耗时 {:.1}s",
+                    task.task_id,
+                    task.opponent_spec,
+                    mode,
+                    result.wins,
+                    result.losses,
+                    result.draws,
+                    started.elapsed().as_secs_f64()
+                );
+                registry.add_completed_games(n);
+                registry.submit_match_report(MatchReport {
+                    task_id: task.task_id.clone(),
+                    kind: TaskKind::TaskEval,
+                    network_sha: task.network_sha.clone(),
+                    opponent_sha: task.opponent_sha.clone(),
+                    opponent_spec: task.opponent_spec.clone(),
+                    games: n,
+                    wins: result.wins,
+                    losses: result.losses,
+                    draws: result.draws,
+                    pairs: [0; 5],
+                    avg_moves: avg,
                 });
             }
             TaskKind::TaskReanalysis => {
@@ -263,25 +328,45 @@ fn avg_steps(episodes: &[GameEpisode]) -> f64 {
     }
 }
 
+/// 被测网络（选手 A）的决策模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkMode {
+    /// Gumbel MCTS（自对弈 / rating / 带搜索的评估档）。
+    Mcts,
+    /// 纯策略 argmax（无搜索）——评估门禁的主口径。
+    PolicyArgmax,
+}
+
+/// 选手 B（对手）的构造方式。
+enum Opponent {
+    /// ONNX 网络（自对弈 / rating / 以网络为对手的评估）。
+    Model(Arc<OnnxModel>),
+    /// 内置随机选手（合法动作上均匀随机）。
+    Random,
+    /// 规则策略（优先吃子 / 优先翻棋），仅评估路径使用。
+    Rule(RuleOpponent),
+}
+
 /// 按变体分发到泛型主干（run_match_core 需静态类型 G）。
 #[allow(clippy::too_many_arguments)]
 fn run_variant_dispatch(
     variant: &str,
     initial_revealed: Option<usize>,
     model_a: Arc<OnnxModel>,
-    model_b: Arc<OnnxModel>,
+    mode: NetworkMode,
+    opponent: Opponent,
     config: &SelfPlayConfig,
     n_games: usize,
     record_episodes: bool,
     pool: &rayon::ThreadPool,
 ) -> Result<MatchResult> {
-    // 批量锁步路径仅用于记录模式（自对弈，双方同一模型）：rating 是异构对手且不产数据，
-    // 必须走单树路径。
+    // 批量锁步路径仅用于记录模式（自对弈，双方同一模型）：rating / eval 是异构对手且不产
+    // 数据，必须走单树路径。
     let batched = record_episodes && config.batched_for(variant);
     match variant {
-        "4x8" => run_games::<DarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, batched, pool),
-        "4x4" => run_games::<Game4x4Env>(initial_revealed, model_a, model_b, config, n_games, record_episodes, batched, pool),
-        "4x2" => run_games::<MiniDarkChessEnv>(initial_revealed, model_a, model_b, config, n_games, record_episodes, batched, pool),
+        "4x8" => run_games::<DarkChessEnv>(initial_revealed, model_a, mode, opponent, config, n_games, record_episodes, batched, pool),
+        "4x4" => run_games::<Game4x4Env>(initial_revealed, model_a, mode, opponent, config, n_games, record_episodes, batched, pool),
+        "4x2" => run_games::<MiniDarkChessEnv>(initial_revealed, model_a, mode, opponent, config, n_games, record_episodes, batched, pool),
         other => anyhow::bail!("未知变体: {other}（可选 4x8 / 4x4 / 4x2）"),
     }
 }
@@ -328,7 +413,8 @@ where
 fn run_games<G>(
     initial_revealed: Option<usize>,
     model_a: Arc<OnnxModel>,
-    model_b: Arc<OnnxModel>,
+    mode: NetworkMode,
+    opponent: Opponent,
     config: &SelfPlayConfig,
     n_games: usize,
     record_episodes: bool,
@@ -352,8 +438,16 @@ where
         }
         None => Arc::new(G::default),
     };
-    let spec_a = PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(model_a)));
-    let spec_b = PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(model_b)));
+    let eval_a = Arc::new(OnnxEvaluator::<G>::new(model_a));
+    let spec_a = match mode {
+        NetworkMode::Mcts => PlayerSpec::ModelEval(eval_a),
+        NetworkMode::PolicyArgmax => PlayerSpec::PolicyArgmax(eval_a),
+    };
+    let spec_b = match opponent {
+        Opponent::Model(m) => PlayerSpec::ModelEval(Arc::new(OnnxEvaluator::<G>::new(m))),
+        Opponent::Random => PlayerSpec::Random,
+        Opponent::Rule(kind) => eval_opponent_spec::<G>(kind),
+    };
     let result = run_match_core(MatchParams {
         player_a: &spec_a,
         player_b: &spec_b,

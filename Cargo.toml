@@ -38,6 +38,11 @@ required-features = ["onnx"]
 name = "onnx_sims_curve"
 required-features = ["onnx"]
 
+# ONNX 模型 vs 规则策略（优先吃子 / 优先翻棋 / 随机）胜率评测
+[[example]]
+name = "onnx_vs_rule"
+required-features = ["onnx"]
+
 # 自对弈数据生成速率基准（纯生成，不含 gRPC/R2）
 [[example]]
 name = "selfplay_throughput"

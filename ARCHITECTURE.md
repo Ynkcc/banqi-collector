@@ -14,12 +14,20 @@
 - `src/registry/scheduler_registry.rs`：`SchedulerRegistry` — gRPC 客户端（`Channel` 长连接，一次建连全程复用）+ reqwest 预签名下载/直传 + sha256 SRI 校验 + 30s 后台心跳；模型按 sha 进程内缓存（每个 sha 一个**会话池**，通道数由 `scheduler.sessions` 决定，A/B、rating 双方共用）。本地权重路径由服务端下发的对象键决定（`cache_dir/<network_key>`），加载器按对象键扩展名分派（`.onnx` → ONNX，其它格式在本构建下直接报错）。上报异步化：`submit_episode_report` / `submit_match_report` 立即返回，`EpisodeBatch` 二进制编码 + gzip + sha256 + R2 直传都在后台 tokio 任务中完成，`report_slots` 信号量限制在途批数（背压 + 约束驻留内存）；心跳发现 best 变化时后台预取该网络。解析 `SelfPlayParams.extra_config`（JSON 透传）中的 `initial_revealed_pieces`，注入 `SchedulerTask.initial_revealed`。
 - `src/pb.rs`：`scheduler.proto` 生成代码（gRPC 客户端 + 训练数据记录消息），唯一来源见 `proto/`。
 - `src/pipeline/self_play/match_core.rs`：`MatchParams.make_env` 为 `Arc<dyn Fn() -> G + Send + Sync>` 环境工厂（支持课程参数闭包注入）；`run_match_core` 其余语义不变。
-- `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `codec` / `batched`），已移除 PyO3（PyPredictor）分支。`codec` 是训练数据记录的唯一编码实现（`EpisodeBatch` 二进制，proto 契约；按数据类别只编码对应的一类记录），训练侧解码在 `banqi_training/episode_codec.py`。`batched` 为可选的批量锁步路径（变体白名单 `SelfPlayConfig.batched_variants` 控制，见下）。`reanalysis` 是跨进程局面重搜的执行端（输入训练侧下发的局面快照 → 用当前网络重跑 MCTS → 「一局面一 episode」走既有上报通道），其数据来源是 `SelfPlayConfig.collect_positions`（记录时把每步局面快照写入 `EpisodeRecord.positions`）。
+- `src/pipeline/self_play/`：自对弈主干 `run_match_core` / `PlayerSpec` / `MatchResult`（`types` / `match_core` / `finalize` / `codec` / `batched`），已移除 PyO3（PyPredictor）分支。`codec` 是训练数据记录的唯一编码实现（`EpisodeBatch` 二进制，proto 契约；按数据类别只编码对应的一类记录），训练侧解码在 `banqi_training/episode_codec.py`。`batched` 为可选的批量锁步路径（变体白名单 `SelfPlayConfig.batched_variants` 控制，见下）。`reanalysis` 是跨进程局面重搜的执行端（输入训练侧下发的局面快照 → 用当前网络重跑 MCTS → 「一局面一 episode」走既有上报通道），其数据来源是 `SelfPlayConfig.collect_positions`（记录时把每步局面快照写入 `EpisodeRecord.positions`）。`rule_opponents`（随 `onnx` feature 编译）是**规则策略对手**的标识解析与适配（优先吃子 / 优先翻棋），供绝对强度评估使用。
+- 选手抽象：`PlayerSpec` 现有 `Expectimax` / `ModelEval`（Gumbel MCTS）/ `PolicyArgmax`（纯策略，无搜索）/ `Rule`（规则策略，无搜索）/ `Random`。`RulePolicy` trait 定义在 `match_core.rs`（只依赖 `banqi-core`），具体策略经 `rule_opponents` 注入 —— 这样库不依赖可选的 `banqi-engine`。规则策略**不参与记录（自对弈）路径**：`play_one_game_recorded` 显式拒绝，避免撞上 `make_evaluator` 的 `unreachable!`。
 - 数据类别：`SchedulerTask.data_kind`（服务端下发）决定本任务产哪类记录；`DATA_RESNET` 走 Gumbel MCTS 记录路径（当前唯一支持的类别），`DATA_NNUE` 需 Expectimax 采集路径（未接入，收到即明确报错退出）。`PlayerSpec::Expectimax` 与 `NnueEpisode` 类型已就位但 bin 尚未构造该选手。
+- 任务类型：`TASK_SELFPLAY`（自对弈产数据）、`TASK_RATING`（gatekeeper 对打）、`TASK_EVAL`（绝对强度评估：best vs `opponent_spec` 指定的规则/内建对手，只统计胜负、不产数据、不参与晋级）、`TASK_REANALYSIS`（局面重搜）。未知 `TaskKind`（proto 新增 + 本二进制过旧）安全降级为「无任务」并打印明确告警，绝不 panic。
 - `proto/scheduler.proto`：与 banqi-scheduler 仓库副本同步维护（双侧同步，变更须同时更新）。
 
 ## 变更记录
 
+- 2026-09-17：**新增规则策略对手与绝对强度评估任务（TASK_EVAL）**：
+  - **proto**（三份副本同步）：`TaskKind` 新增 `TASK_EVAL`；`TaskResponse` 新增 `opponent_spec`（规则/内建对手标识）；`MatchResult` 新增 `opponent_spec` 与 `avg_moves`（评估统计）。
+  - **选手抽象**：`match_core.rs` 新增 `RulePolicy` trait（只依赖 `banqi-core`，不把可选依赖 `banqi-engine` 拉进库）与 `PlayerSpec::Rule`；`make_evaluator` / `get_player_action` 补分支，记录路径显式拒绝规则选手。新增 `rule_opponents.rs`（随 `onnx` feature）：解析 `random` / `rule:capture_first` / `rule:reveal_first`（`rule:` 前缀可选）并复用 `banqi-engine` 的 `CaptureFirstPolicy` / `RevealFirstPolicy`。
+  - **bin**：`run_variant_dispatch` / `run_games` 由「双方写死 `ModelEval`」改为按 `NetworkMode`（Mcts / PolicyArgmax）+ `Opponent`（Model / Random / Rule）构造；新增 `TaskKind::TaskEval` 分支 —— `mcts_sims == 0` 走纯策略 argmax、>0 走该深度的 MCTS，结果经 `submit_match_report`（`kind=TASK_EVAL`）上报，不产 episode。`get_task` 对未知 `TaskKind` 与非法 `opponent_spec` 快速失败/安全降级。
+  - **CLI**：`examples/onnx_vs_rule` 提升为绝对强度阶梯评测工具（多对手 × 多搜索档位、`--json` 输出，复用 `rule_opponents`）。实测 4x8 上一轮产物：纯策略 vs 优先吃子 57.1%、vs 优先翻棋 99.0%、vs 随机 96.4%（各 1000 局）。
+  - **顺带修复**：`examples/selfplay_throughput` 缺少 `MatchParams.opponent_sims` 字段导致的编译失败（既有问题，工作区 `main` 上该 example 无法编译）。
 - 2026-09-16：**局面重搜任务类型接入（N9 阶段 3）**：
   - **proto**（三份副本同步、Go pb 与 Python pb2 已按各自记录的配方重新生成）：`TaskKind` 新增 `TASK_REANALYSIS`、`TaskResponse.reanalysis_payload`、`SubmitReanalysis` RPC（训练侧发起）。
   - **registry**：`SchedulerTask` 新增 `reanalysis_payload`（不透明字节，由服务端下发）；权重按 `network_key` 下载与既有一致，变体/类别校验沿用同一条路径（重搜任务恒为 `DATA_RESNET`）。
@@ -112,5 +120,29 @@ batched_variants = []     # 走批量锁步路径的变体白名单（空 = 全�
                           # 是异构对手，恒走单树）；启用时建议把 sessions 调小（≈ 批量评估
                           # worker 数 = threads.min(8)），让每个会话分到更多 intra-op 线程。
 ```
+
+### 绝对强度阶梯评测（`examples/onnx_vs_rule`，须带 `onnx` feature）
+
+离线单发口径，用于**训练前基线 / 复现某次评测 / CI 回归**；与调度器侧自动评测（`TASK_EVAL`）
+走同一条 `run_match_core` 链路与同一份规则对手实现，两边结论可直接对照。
+
+```bash
+# 默认阶梯：优先吃子 / 优先翻棋 / 随机，各 1000 局，纯策略 argmax（无搜索）
+cargo run --release --features onnx --example onnx_vs_rule -- \
+  --variant 4x8 --model <model.onnx> --games 1000 --seed 1
+
+# 搜索阶梯：同一对手，分别用纯策略 / MCTS@64 / MCTS@256
+cargo run --release --features onnx --example onnx_vs_rule -- \
+  --model <model.onnx> --opponents rule:capture_first --sims 0,64,256 --games 300
+
+# JSON 输出（脚本 / 门禁自动化消费）
+cargo run --release --features onnx --example onnx_vs_rule -- \
+  --model <model.onnx> --json
+```
+
+⚠️ 两个注意点：
+1. `--variant` 必须与模型的动作空间一致，否则评估器维度不符；
+2. 对手策略自带随机性（`thread_rng`），**同一 seed 的两次运行不会逐局相同**，比较结论要看
+   统计量（1000 局 SE≈1.6pt，3000 局 SE≈0.9pt），不要拿单次结果的小数点后一位下结论。
 
 课程学习：调度器经 `extra_config` 下发 `initial_revealed_pieces` 时，bin 以 `banqi_core::core::env::CurriculumEnv::with_initial_revealed(n)` 构造每局环境（覆盖变体默认值，棋盘/动作空间/特征维度不变，网络跨阶段通用）；未下发时用变体默认配置。

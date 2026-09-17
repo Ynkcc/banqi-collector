@@ -33,6 +33,10 @@ message TaskResponse {
   // banqi-collector/src/pipeline/self_play/reanalysis.rs 的 encode_payload）。
   // 其余任务为空。games 字段对重搜任务表示「位置条数」。
   bytes reanalysis_payload = 13;
+  // 绝对强度评估（TASK_EVAL）的对手标识；空 = 用 opponent_sha / opponent_url 指定的网络。
+  // 取值形如 "rule:capture_first" / "rule:reveal_first" / "random"。
+  // 评估模式（纯策略 / 带搜索）由 params.mcts_sims 决定：0 = 纯策略 argmax，>0 = MCTS 模拟数。
+  string opponent_spec = 14;
 }
 
 enum TaskKind {
@@ -42,6 +46,10 @@ enum TaskKind {
   // 局面重搜（reanalysis）：用当前 best 网络对下发的历史局面重跑 MCTS，
   // 产出新的策略/价值目标（一局面一条 1 样本 episode），走 ReportEpisode 常规通道上报。
   TASK_REANALYSIS = 3;
+  // 绝对强度评估（eval）：指定网络 vs 规则/内建对手，只统计胜负、不产 episode、
+  // 不参与 gatekeeper 晋级（结果落 eval_results，仅用于趋势观测与停机判据）。
+  // 对手由 TaskResponse.opponent_spec 指定；评估模式由 SelfPlayParams.mcts_sims 决定。
+  TASK_EVAL = 4;
 }
 
 // 训练数据类别：决定 worker 产哪类记录、trainer 消费哪类对象。
@@ -129,6 +137,11 @@ message MatchResult {
   int32 pair_dd = 12;
   int32 pair_dw = 13;
   int32 pair_ww = 14;
+  // 绝对强度评估（TASK_EVAL）：对手标识（与 TaskResponse.opponent_spec 同源，回显便于对账）。
+  // 其余任务为空。
+  string opponent_spec = 15;
+  // 平均对局步数（TASK_EVAL 统计用；rating / selfplay 未填时为 0）。
+  float avg_moves = 16;
 }
 
 message MatchResultAck {
@@ -215,6 +228,11 @@ message GetInfoRequest {}
 
 message GetInfoReply {
   string variant = 1;
+  // trainer 轮询：true 时按既有优雅停止路径收尾（先让 worker 完成当前轮并落
+  // checkpoint，再退出）。由调度器按绝对强度判据置位（如「连续 N 次评测无提升」），
+  // 见 banqi-scheduler/internal/scheduler/eval.go。
+  bool should_stop = 2;
+  string stop_reason = 3;
 }
 
 // ============================================================================

@@ -36,7 +36,7 @@ use tonic::transport::{Channel, Endpoint};
 use banqi_engine::inference::onnx::OnnxModel;
 
 use crate::pb;
-use crate::pipeline::self_play::{GameEpisode, NnueEpisode, encode_episode_batch};
+use crate::pipeline::self_play::{GameEpisode, NnueEpisode, RuleOpponent, encode_episode_batch};
 
 use pb::scheduler_service_client::SchedulerServiceClient;
 use pb::{
@@ -102,6 +102,9 @@ pub struct SchedulerTask {
     pub initial_revealed: Option<usize>,
     /// 本任务要产的数据类别（服务端下发；已在 get_task 校验为本构建支持的值）
     pub data_kind: DataKind,
+    /// 评估任务（TASK_EVAL）的对手标识：`rule:capture_first` / `rule:reveal_first` /
+    /// `random`；空 = 对手是 `opponent_sha` 指向的网络。其余任务为空。
+    pub opponent_spec: String,
     /// 重搜任务（TASK_REANALYSIS）携带的历史局面载荷；其余任务为空。
     pub reanalysis_payload: Vec<u8>,
 }
@@ -121,16 +124,22 @@ pub struct EpisodeBatch {
     pub nnue_episodes: Vec<NnueEpisode>,
 }
 
-/// rating 结果上报载荷（五项成对计数）。
+/// 对战结果上报载荷（rating 五项成对计数 / eval 胜负统计）。
 pub struct MatchReport {
     pub task_id: String,
+    /// 任务类别：TASK_RATING 参与 gatekeeper 判停；TASK_EVAL 仅落库（不参与晋级）。
+    pub kind: TaskKind,
     pub network_sha: String,
     pub opponent_sha: String,
+    /// 评估任务（TASK_EVAL）的对手标识；rating 为空。
+    pub opponent_spec: String,
     pub games: usize,
     pub wins: usize,
     pub losses: usize,
     pub draws: usize,
     pub pairs: [usize; 5],
+    /// 平均对局步数（评估统计用）；rating 调用方填 0。
+    pub avg_moves: f32,
 }
 
 pub struct SchedulerRegistry {
@@ -313,6 +322,17 @@ impl SchedulerRegistry {
             .with_context(|| "GetTask 调用失败".to_string())?
             .into_inner();
 
+        // 未知 TaskKind（调度器已升级、collector 版本过旧）：安全降级为「无任务」并记
+        // 明确日志，绝不因枚举不识别而 panic。注意 `resp.kind()` 会把未识别的值折叠成
+        // 默认值，故这里读原始 i32 判断。
+        if TaskKind::try_from(resp.kind).is_err() {
+            eprintln!(
+                "[scheduler] ⚠️ 收到本构建不认识的 TaskKind={}（collector 版本过旧？），已忽略本任务",
+                resp.kind
+            );
+            return Ok(None);
+        }
+
         if resp.kind() == TaskKind::TaskNone {
             if !resp.message.is_empty() {
                 println!("[scheduler] 无任务: {}", resp.message);
@@ -360,11 +380,27 @@ impl SchedulerRegistry {
             variant,
             initial_revealed,
             data_kind,
+            opponent_spec: resp.opponent_spec.trim().to_string(),
             reanalysis_payload: resp.reanalysis_payload.clone(),
         };
 
-        // rating 任务：对手网络同样需就绪（各自的对象键按格式区分）
-        if task.kind == TaskKind::TaskRating {
+        // 评估任务的对手标识需在本构建支持范围内：fail fast，避免白下载一遍网络后才发现
+        if task.kind == TaskKind::TaskEval
+            && !task.opponent_spec.is_empty()
+            && task.opponent_spec != "random"
+            && RuleOpponent::parse(&task.opponent_spec).is_none()
+        {
+            anyhow::bail!(
+                "不支持的评估对手标识: {}（可选 random / rule:capture_first / rule:reveal_first）",
+                task.opponent_spec
+            );
+        }
+
+        // 对手为「网络」的场景（rating，或 opponent_spec 为空的 eval）：对手网络同样需就绪
+        // （各自的对象键按格式区分）。规则/随机对手没有网络文件，跳过下载。
+        if matches!(task.kind, TaskKind::TaskRating | TaskKind::TaskEval)
+            && task.opponent_spec.is_empty()
+        {
             if resp.opponent_key.is_empty() {
                 anyhow::bail!("服务端未下发 opponent_key（调度器版本过旧），无法确定对手权重格式");
             }
@@ -372,8 +408,10 @@ impl SchedulerRegistry {
         }
 
         println!(
-            "[scheduler] 任务 task={} kind={:?} variant={} network={} opponent={} games={} initial_revealed={:?}",
-            task.task_id, task.kind, task.variant, task.network_sha, task.opponent_sha, task.games, task.initial_revealed
+            "[scheduler] 任务 task={} kind={:?} variant={} network={} opponent={}{} games={} initial_revealed={:?}",
+            task.task_id, task.kind, task.variant, task.network_sha, task.opponent_sha,
+            if task.opponent_spec.is_empty() { String::new() } else { format!("[{}]", task.opponent_spec) },
+            task.games, task.initial_revealed
         );
         Ok(Some(task))
     }
@@ -520,7 +558,7 @@ async fn report_match_async(
         .report_match_result(PbMatchResult {
             worker_id: worker_id.to_string(),
             task_id: rep.task_id,
-            kind: TaskKind::TaskRating as i32,
+            kind: rep.kind as i32,
             network_sha: rep.network_sha,
             opponent_sha: rep.opponent_sha,
             games: rep.games as i32,
@@ -532,6 +570,8 @@ async fn report_match_async(
             pair_dd: rep.pairs[2] as i32,
             pair_dw: rep.pairs[3] as i32,
             pair_ww: rep.pairs[4] as i32,
+            opponent_spec: rep.opponent_spec,
+            avg_moves: rep.avg_moves,
         })
         .await
         .context("ReportMatchResult 调用失败")?
