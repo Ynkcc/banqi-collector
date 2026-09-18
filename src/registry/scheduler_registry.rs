@@ -54,6 +54,9 @@ const SUPPORTED_DATA_KIND: DataKind = DataKind::DataResnet;
 /// 心跳间隔
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// 启动期连接调度器的重试间隔
+const CONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
 /// HTTP 超时（模型下载 / R2 直传）
 const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -175,12 +178,22 @@ impl SchedulerRegistry {
             .build()
             .context("构建 tokio runtime 失败")?;
 
+        // 启动期连接失败不退出：持续重试直到调度器可达（transport 层 channel 建立后自带重连）
         let channel = rt.block_on(async {
-            Endpoint::from_shared(cfg.endpoint.clone())
-                .with_context(|| format!("非法调度器地址: {}", cfg.endpoint))?
-                .connect()
-                .await
-                .with_context(|| format!("连接调度器失败: {}", cfg.endpoint))
+            let ep = Endpoint::from_shared(cfg.endpoint.clone())
+                .with_context(|| format!("非法调度器地址: {}", cfg.endpoint))?;
+            loop {
+                match ep.connect().await {
+                    Ok(ch) => return Ok(ch),
+                    Err(e) => {
+                        eprintln!(
+                            "[scheduler] ⚠️ 连接调度器失败: {}（{CONNECT_BACKOFF:?} 后重试）: {e}",
+                            cfg.endpoint
+                        );
+                        tokio::time::sleep(CONNECT_BACKOFF).await;
+                    }
+                }
+            }
         })?;
 
         let http = reqwest::Client::builder()

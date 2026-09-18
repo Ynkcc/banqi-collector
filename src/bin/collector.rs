@@ -34,6 +34,9 @@ use banqi_engine::inference::onnx::{OnnxModel, OnnxEvaluator};
 /// 无任务时的轮询退避
 const TASK_BACKOFF: Duration = Duration::from_secs(30);
 
+/// 与调度器通信失败后的重试退避
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(10);
+
 #[derive(Parser, Debug)]
 #[command(name = "banqi-collector", about = "分布式自对弈采集进程（scheduler backend）")]
 struct Args {
@@ -95,14 +98,21 @@ fn run_scheduler(
     let mut iteration: usize = 0;
 
     while args.iterations == 0 || iteration < args.iterations {
-        let task = match registry.get_task()? {
-            Some(t) => {
-                registry.set_running_task(&t.task_id);
-                t
-            }
-            None => {
-                std::thread::sleep(TASK_BACKOFF);
-                continue;
+        let task = loop {
+            match registry.get_task() {
+                Ok(Some(t)) => {
+                    registry.set_running_task(&t.task_id);
+                    break t;
+                }
+                Ok(None) => {
+                    std::thread::sleep(TASK_BACKOFF);
+                }
+                Err(e) if is_transport_error(&e) => {
+                    eprintln!(
+                        "[scheduler] ⚠️ 与调度器通信失败（{RECONNECT_BACKOFF:?} 后重试）: {e:#}"
+                    );
+                    std::thread::sleep(RECONNECT_BACKOFF);
+                }
             }
         };
 
@@ -309,6 +319,15 @@ fn run_scheduler(
 /// （`concurrency.min(8)`），使「在途批数 ≈ 会话数」，避免多余会话各自摊薄 intra-op 线程。
 fn batch_worker_hint(concurrency: usize) -> usize {
     concurrency.min(8).max(1)
+}
+
+/// 判断错误是否为可重试的网络类错误（gRPC 状态 / HTTP 请求失败）。
+/// 配置校验、数据类别不支持等确定性错误仍按致命处理，不进入重试循环。
+fn is_transport_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<tonic::Status>().is_some()
+            || cause.downcast_ref::<reqwest::Error>().is_some()
+    })
 }
 
 /// 自对弈线程池：`threads = 0` 取 CPU 核数。

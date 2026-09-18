@@ -4,7 +4,7 @@
 
 ## 定位
 
-- 仅服务分布式训练链路：作为 gRPC 客户端对接 Go 版 `banqi-scheduler`（GetTask / ReportEpisode / ReportMatchResult / Heartbeat 等 9 RPC），episode 数据经 R2 预签名 URL 直传。
+- 仅服务分布式训练链路：作为 gRPC 客户端对接 Go 版 `banqi-scheduler`（使用 GetTask / GetNetwork / ReportEpisode / ReportMatchResult / Heartbeat；`proto/scheduler.proto` 与调度器副本同步维护，含本 crate 未调用的 RPC），episode 数据经 R2 预签名 URL 直传。
 - 依赖 `banqi-core`（领域核心）与 `banqi-engine`（ONNX 推理 `OnnxModel` / `OnnxEvaluator`，feature `onnx` / `onnx-cuda`）。
 - 不含本地采集（`--backend local` 的 LocalRegistry / LocalEpisodeStore），该形态留在 rust_4x8 主仓库。
 
@@ -22,6 +22,7 @@
 
 ## 变更记录
 
+- 2026-09-18：**proto 副本同步**：调度器新增 `GetTrainConfig` RPC（训练超参远程读取/热更，见 banqi-scheduler §5.1），本仓库 `proto/scheduler.proto` 随之同步（契约层新增，本 crate 不调用，`cargo check` 通过）。
 - 2026-09-17：**新增规则策略对手与绝对强度评估任务（TASK_EVAL）**：
   - **proto**（三份副本同步）：`TaskKind` 新增 `TASK_EVAL`；`TaskResponse` 新增 `opponent_spec`（规则/内建对手标识）；`MatchResult` 新增 `opponent_spec` 与 `avg_moves`（评估统计）。
   - **选手抽象**：`match_core.rs` 新增 `RulePolicy` trait（只依赖 `banqi-core`，不把可选依赖 `banqi-engine` 拉进库）与 `PlayerSpec::Rule`；`make_evaluator` / `get_player_action` 补分支，记录路径显式拒绝规则选手。新增 `rule_opponents.rs`（随 `onnx` feature）：解析 `random` / `rule:capture_first` / `rule:reveal_first`（`rule:` 前缀可选）并复用 `banqi-engine` 的 `CaptureFirstPolicy` / `RevealFirstPolicy`。

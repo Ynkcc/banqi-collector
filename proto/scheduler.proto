@@ -235,6 +235,25 @@ message GetInfoReply {
   string stop_reason = 3;
 }
 
+// trainer 拉取运行时可调训练配置：启动时拉一次做 bootstrap（覆盖本地 YAML 中的
+// 对应字段），运行中按 SHOULD_STOP_POLL_SECONDS 周期拉取以热更新训练动力学参数。
+//
+// overrides 是「字段名 → 值」映射，字段名与 banqi_training.config.Config 的字段
+// 一一对应；未出现的字段保持 trainer 本地配置值（未下发 ≠ 设为零值）。可调字段
+// 白名单与取值校验由调度器权威裁定（banqi-scheduler/internal/scheduler/
+// trainconfig.go），故本消息不做字段级 proto 定义：新增可调项不必改契约。
+message GetTrainConfigRequest {
+  string variant = 1;      // 必须与服务端 VARIANT 一致，否则拒绝（防串变体）
+  string trainer_id = 2;   // 提交方标识（日志用）
+}
+
+message GetTrainConfigReply {
+  // false = 拒绝下发（变体不符等），overrides 为空；trainer 记日志后继续用本地配置。
+  bool accepted = 1;
+  string message = 2;
+  map<string, string> overrides = 3;
+}
+
 // ============================================================================
 // 训练数据记录（episode 对象载荷）
 //
@@ -339,4 +358,6 @@ service SchedulerService {
   rpc ListEpisodes (ListEpisodesRequest) returns (ListEpisodesReply);
   // trainer 提交局面重搜任务（异步：入队后由 GetTask 分发给任意 worker）
   rpc SubmitReanalysis (SubmitReanalysisRequest) returns (SubmitReanalysisReply);
+  // trainer 拉取运行时可调训练配置（启动 bootstrap + 运行中热更）
+  rpc GetTrainConfig (GetTrainConfigRequest) returns (GetTrainConfigReply);
 }
