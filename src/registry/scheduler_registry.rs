@@ -184,7 +184,7 @@ impl SchedulerRegistry {
                 .with_context(|| format!("非法调度器地址: {}", cfg.endpoint))?;
             loop {
                 match ep.connect().await {
-                    Ok(ch) => return Ok(ch),
+                    Ok(ch) => return Ok::<_, anyhow::Error>(ch),
                     Err(e) => {
                         eprintln!(
                             "[scheduler] ⚠️ 连接调度器失败: {}（{CONNECT_BACKOFF:?} 后重试）: {e}",

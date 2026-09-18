@@ -113,6 +113,12 @@ fn run_scheduler(
                     );
                     std::thread::sleep(RECONNECT_BACKOFF);
                 }
+                Err(e) => {
+                    eprintln!(
+                        "[scheduler] ⚠️ 获取任务失败（{TASK_BACKOFF:?} 后重试）: {e:#}"
+                    );
+                    std::thread::sleep(TASK_BACKOFF);
+                }
             }
         };
 
